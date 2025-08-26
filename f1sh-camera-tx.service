@@ -1,0 +1,42 @@
+[Unit]
+Description=F1sh Camera TX - Video Streaming Service
+Documentation=https://github.com/F1sh-org/F1sh-Camera-TX
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=video
+WorkingDirectory=/opt/f1sh-camera-tx
+ExecStart=/opt/f1sh-camera-tx/F1sh-Camera-TX
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables
+Environment=GST_DEBUG=2
+Environment=GST_PLUGIN_PATH=/usr/lib/gstreamer-1.0
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=512M
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/f1sh-camera-tx
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Device access for camera
+DeviceAllow=/dev/video* rw
+DeviceAllow=/dev/media* rw
+SupplementaryGroups=video
+
+[Install]
+WantedBy=multi-user.target
