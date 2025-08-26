@@ -20,7 +20,7 @@
 #define DEFAULT_ENCODER "v4l2h264enc"
 #define DEFAULT_WIDTH 1280
 #define DEFAULT_HEIGHT 720
-#define DEFAULT_FRAMERATE 30
+#define DEFAULT_FRAMERATE 60
 
 // Application data structure
 typedef struct _AppConfig {
@@ -274,7 +274,7 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         return FALSE;
     }
 
-    GstElement *src, *capsfilter, *videoconvert, *encoder, *parser, *payloader, *sink;
+    GstElement *src, *capsfilter, *encoder, *encoder_caps, *parser, *payloader, *sink;
     GstCaps *caps;
 
     src = gst_element_factory_make(data->config.src_type, "source");
@@ -303,18 +303,13 @@ static gboolean build_and_run_pipeline(CustomData *data) {
                                "framerate", GST_TYPE_FRACTION, data->config.framerate, 1,
                                NULL);
     if (strcmp(data->config.src_type, "libcamerasrc") == 0) {
-        // Use I420 format for better compatibility with hardware encoders
-        gst_caps_set_simple(caps, "format", G_TYPE_STRING, "I420", NULL);
+        // Use the exact format from the working gst-launch command
+        gst_caps_set_simple(caps, "format", G_TYPE_STRING, "YUY2",
+                                  "colorimetry", G_TYPE_STRING, "bt709",
+                                  "interlace-mode", G_TYPE_STRING, "progressive", NULL);
     }
     g_object_set(capsfilter, "caps", caps, NULL);
     gst_caps_unref(caps);
-
-    // Add videoconvert for format conversion
-    videoconvert = gst_element_factory_make("videoconvert", "videoconvert");
-    if (!videoconvert) {
-        g_printerr("Failed to create videoconvert element.\n");
-        goto error;
-    }
 
     encoder = gst_element_factory_make(data->config.encoder_type, "encoder");
     if (!encoder) {
@@ -346,26 +341,33 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     } else if (strcmp(data->config.encoder_type, "v4l2h264enc") == 0 ||
                (gst_element_get_factory(encoder) && 
                 strcmp(GST_OBJECT_NAME(gst_element_get_factory(encoder)), "v4l2h264enc") == 0)) {
-        // Optimized settings for Raspberry Pi v4l2h264enc
+        // Use the exact same settings as the working gst-launch command
         GstStructure *ctrls = gst_structure_new("controls", 
                                                "repeat_sequence_header", G_TYPE_BOOLEAN, TRUE,
-                                               "h264_profile", G_TYPE_INT, 1, // Baseline profile
-                                               "video_bitrate", G_TYPE_INT, 2000000, // 2Mbps
                                                NULL);
         g_object_set(encoder, "extra-controls", ctrls, NULL);
         gst_structure_free(ctrls);
     }
 
     parser = gst_element_factory_make("h264parse", "parser");
+    
+    // Add caps filter after encoder to match the working pipeline
+    encoder_caps = gst_element_factory_make("capsfilter", "encoder_caps");
+    GstCaps *h264_caps = gst_caps_new_simple("video/x-h264",
+                                             "level", G_TYPE_STRING, "4",
+                                             NULL);
+    g_object_set(encoder_caps, "caps", h264_caps, NULL);
+    gst_caps_unref(h264_caps);
+
     payloader = gst_element_factory_make("rtph264pay", "payloader");
     g_object_set(payloader, "config-interval", -1, NULL);
 
     sink = gst_element_factory_make("udpsink", "sink");
     g_object_set(sink, "host", data->config.host, "port", data->config.port, "sync", FALSE, "async", FALSE, NULL);
 
-    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, videoconvert, encoder, parser, payloader, sink, NULL);
+    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL);
 
-    if (!gst_element_link_many(src, capsfilter, videoconvert, encoder, parser, payloader, sink, NULL)) {
+    if (!gst_element_link_many(src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL)) {
         g_printerr("Failed to link elements.\n");
         goto error;
     }
