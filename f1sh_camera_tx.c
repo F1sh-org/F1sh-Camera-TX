@@ -34,6 +34,7 @@ typedef struct _AppConfig {
     gint height;
     gint framerate;
     gboolean autofocus;
+    gfloat lens_position; // 0.0 = close focus, 1.0+ = far/infinity focus
 } AppConfig;
 
 typedef struct _CustomData {
@@ -74,6 +75,7 @@ void init_config(AppConfig *config) {
     config->height = DEFAULT_HEIGHT;
     config->framerate = DEFAULT_FRAMERATE;
     config->autofocus = DEFAULT_AUTOFOCUS;
+    config->lens_position = 1.0; // Default to far focus
 }
 
 void free_config_members(AppConfig *config) {
@@ -131,6 +133,7 @@ static enum MHD_Result handle_get_config(struct MHD_Connection *connection, Cust
     json_object_set_new(root, "height", json_integer(data->config.height));
     json_object_set_new(root, "framerate", json_integer(data->config.framerate));
     json_object_set_new(root, "autofocus", json_boolean(data->config.autofocus));
+    json_object_set_new(root, "lens_position", json_real(data->config.lens_position));
     g_mutex_unlock(&data->state_mutex);
 
     char *json_str = json_dumps(root, 0);
@@ -228,9 +231,16 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         data->config.autofocus = json_boolean_value(value);
     }
 
-    g_print("Configuration updated: host=%s, port=%d, src=%s, encoder=%s, autofocus=%s\n", 
+    value = json_object_get(root, "lens_position");
+    if (json_is_real(value)) {
+        data->config.lens_position = json_real_value(value);
+    } else if (json_is_integer(value)) {
+        data->config.lens_position = (gfloat)json_integer_value(value);
+    }
+
+    g_print("Configuration updated: host=%s, port=%d, src=%s, encoder=%s, autofocus=%s, lens_position=%.2f\n", 
             data->config.host, data->config.port, data->config.src_type, data->config.encoder_type,
-            data->config.autofocus ? "enabled" : "disabled");
+            data->config.autofocus ? "enabled" : "disabled", data->config.lens_position);
     
     data->pipeline_is_restarting = TRUE;
 
@@ -337,25 +347,28 @@ static gboolean build_and_run_pipeline(CustomData *data) {
             if (strlen(data->config.device) == 0) g_free(device_path);
         }
     } else if (strcmp(data->config.src_type, "libcamerasrc") == 0) {
-        // Optimize libcamerasrc for low latency and memory usage
-        g_object_set(src, "camera-name", "/base/soc/i2c0mux/i2c@1/imx708@1a", NULL);
+        // Don't force specific camera name - let libcamera auto-detect
+        // g_object_set(src, "camera-name", "/base/soc/i2c0mux/i2c@1/imx708@1a", NULL);
         
         // Configure autofocus for Camera Module 3
         if (data->config.autofocus) {
             g_print("Enabling autofocus for Camera Module 3\n");
             
-            // Create controls structure for autofocus
+            // Use the correct libcamera control names for autofocus
             GstStructure *controls = gst_structure_new("controls",
-                "AfMode", G_TYPE_INT, 2,  // Continuous autofocus mode
-                "AfTrigger", G_TYPE_INT, 0,  // Start autofocus
+                "AfMode", G_TYPE_INT, 2,           // AfModeContinuous
+                "AfSpeed", G_TYPE_INT, 1,          // Fast autofocus speed
+                "AfRange", G_TYPE_INT, 0,          // AfRangeNormal (full range)
+                "LensPosition", G_TYPE_FLOAT, 0.0, // Let AF control lens position
                 NULL);
             g_object_set(src, "controls", controls, NULL);
             gst_structure_free(controls);
         } else {
-            g_print("Autofocus disabled\n");
-            // Set manual focus mode
+            g_print("Autofocus disabled - using manual focus at position %.2f\n", data->config.lens_position);
+            // Set manual focus mode with configurable lens position
             GstStructure *controls = gst_structure_new("controls",
-                "AfMode", G_TYPE_INT, 0,  // Manual focus mode
+                "AfMode", G_TYPE_INT, 0,                           // AfModeManual
+                "LensPosition", G_TYPE_FLOAT, data->config.lens_position, // User-configurable focus
                 NULL);
             g_object_set(src, "controls", controls, NULL);
             gst_structure_free(controls);
