@@ -42,11 +42,7 @@ typedef struct _StreamStats {
     guint64 total_bytes;
     guint64 frame_count;
     gdouble current_bitrate;        // kbps
-    gdouble actual_framerate;       // fps
-    gdouble buffer_fullness;        // percentage (0-100)
-    GstClockTime last_timestamp;
     GstClockTime start_time;
-    GstClockTime last_frame_time;
     GMutex stats_mutex;
 } StreamStats;
 
@@ -110,30 +106,10 @@ udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *in
     if (buffer) {
         g_mutex_lock(&data->stats.stats_mutex);
         
-        // Update byte count
+        // Update byte count and frame count
         gsize buffer_size = gst_buffer_get_size(buffer);
         data->stats.total_bytes += buffer_size;
         data->stats.frame_count++;
-        
-        // Calculate average framerate over the entire streaming session
-        GstClockTime current_time = g_get_monotonic_time(); // microseconds
-        
-        if (data->stats.last_frame_time == 0) {
-            // First frame - just record the time
-            data->stats.last_frame_time = current_time;
-        } else if (data->stats.frame_count > 10) { // Only calculate after we have some frames
-            // Calculate average FPS since streaming started
-            GstClockTime total_time_us = current_time - data->stats.last_frame_time;
-            if (total_time_us > 0) {
-                // Average FPS = (frames - 1) / time_elapsed_seconds
-                gdouble time_elapsed_seconds = (gdouble)total_time_us / 1000000.0;
-                data->stats.actual_framerate = (gdouble)(data->stats.frame_count - 1) / time_elapsed_seconds;
-                
-                // Calculate buffer performance as ratio of actual vs target framerate
-                gdouble fps_ratio = data->stats.actual_framerate / data->config.framerate;
-                data->stats.buffer_fullness = CLAMP(fps_ratio * 100.0, 0.0, 150.0); // Cap at 150%
-            }
-        }
         
         g_mutex_unlock(&data->stats.stats_mutex);
     }
@@ -167,11 +143,7 @@ void init_stats(StreamStats *stats) {
     stats->total_bytes = 0;
     stats->frame_count = 0;
     stats->current_bitrate = 0.0;
-    stats->actual_framerate = 0.0;
-    stats->buffer_fullness = 0.0;
-    stats->last_timestamp = 0;
     stats->start_time = gst_clock_get_time(gst_system_clock_obtain());
-    stats->last_frame_time = 0;
     g_mutex_init(&stats->stats_mutex);
 }
 
@@ -274,20 +246,6 @@ static enum MHD_Result handle_get_stats(struct MHD_Connection *connection, Custo
     json_object_set_new(root, "total_bytes", json_integer(data->stats.total_bytes));
     json_object_set_new(root, "frame_count", json_integer(data->stats.frame_count));
     json_object_set_new(root, "current_bitrate_kbps", json_real(current_bitrate));
-    json_object_set_new(root, "actual_framerate", json_real(data->stats.actual_framerate));
-    json_object_set_new(root, "buffer_fullness_percent", json_real(data->stats.buffer_fullness));
-    json_object_set_new(root, "elapsed_time_seconds", json_real(elapsed_seconds));
-    
-    // Performance metrics
-    gdouble target_fps = data->config.framerate;
-    gdouble fps_efficiency = 0.0;
-    if (target_fps > 0 && data->stats.actual_framerate > 0) {
-        fps_efficiency = (data->stats.actual_framerate / target_fps) * 100.0;
-        // Clamp efficiency to reasonable bounds
-        fps_efficiency = CLAMP(fps_efficiency, 0.0, 200.0);
-    }
-    json_object_set_new(root, "target_framerate", json_real(target_fps));
-    json_object_set_new(root, "framerate_efficiency_percent", json_real(fps_efficiency));
     
     g_mutex_unlock(&data->stats.stats_mutex);
 
@@ -609,9 +567,6 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     data->stats.total_bytes = 0;
     data->stats.frame_count = 0;
     data->stats.current_bitrate = 0.0;
-    data->stats.actual_framerate = 0.0;
-    data->stats.buffer_fullness = 0.0;
-    data->stats.last_frame_time = 0; // Will be set on first frame
     data->stats.start_time = gst_clock_get_time(gst_system_clock_obtain());
     g_mutex_unlock(&data->stats.stats_mutex);
     
