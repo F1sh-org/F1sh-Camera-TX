@@ -37,11 +37,23 @@ typedef struct _AppConfig {
     gfloat lens_position; // 0.0 = close focus, 1.0+ = far/infinity focus
 } AppConfig;
 
+// Statistics structure
+typedef struct _StreamStats {
+    guint64 total_bytes;
+    guint64 frame_count;
+    gdouble current_bitrate;    // kbps
+    gdouble average_latency;    // ms
+    GstClockTime last_timestamp;
+    GstClockTime start_time;
+    GMutex stats_mutex;
+} StreamStats;
+
 typedef struct _CustomData {
     GstElement *pipeline;
     GstBus *bus;
     struct MHD_Daemon *daemon;
     AppConfig config;
+    StreamStats stats;
     GMutex state_mutex;
     gboolean pipeline_is_restarting;
     gboolean should_terminate;
@@ -64,6 +76,43 @@ static void request_completed(void *cls, struct MHD_Connection *connection,
 static gboolean build_and_run_pipeline(CustomData *data);
 static void free_config_members(AppConfig *config);
 
+// Probe callback to monitor data flow
+static GstPadProbeReturn
+udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *info, gpointer user_data)
+{
+    CustomData *data = (CustomData *)user_data;
+    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    
+    if (buffer) {
+        g_mutex_lock(&data->stats.stats_mutex);
+        
+        // Update byte count
+        gsize buffer_size = gst_buffer_get_size(buffer);
+        data->stats.total_bytes += buffer_size;
+        data->stats.frame_count++;
+        
+        // Calculate latency (simplified - time since buffer creation to now)
+        GstClockTime buffer_pts = GST_BUFFER_PTS(buffer);
+        GstClockTime current_time = gst_clock_get_time(gst_system_clock_obtain());
+        
+        if (GST_CLOCK_TIME_IS_VALID(buffer_pts)) {
+            GstClockTime latency = current_time - buffer_pts;
+            gdouble latency_ms = (gdouble)latency / GST_MSECOND;
+            
+            // Simple moving average for latency
+            if (data->stats.average_latency == 0.0) {
+                data->stats.average_latency = latency_ms;
+            } else {
+                data->stats.average_latency = (data->stats.average_latency * 0.9) + (latency_ms * 0.1);
+            }
+        }
+        
+        g_mutex_unlock(&data->stats.stats_mutex);
+    }
+    
+    return GST_PAD_PROBE_OK;
+}
+
 // Initialize with default values
 void init_config(AppConfig *config) {
     config->host = g_strdup(DEFAULT_HOST);
@@ -83,6 +132,21 @@ void free_config_members(AppConfig *config) {
     g_free(config->src_type);
     g_free(config->device);
     g_free(config->encoder_type);
+}
+
+// Initialize statistics
+void init_stats(StreamStats *stats) {
+    stats->total_bytes = 0;
+    stats->frame_count = 0;
+    stats->current_bitrate = 0.0;
+    stats->average_latency = 0.0;
+    stats->last_timestamp = 0;
+    stats->start_time = gst_clock_get_time(gst_system_clock_obtain());
+    g_mutex_init(&stats->stats_mutex);
+}
+
+void free_stats(StreamStats *stats) {
+    g_mutex_clear(&stats->stats_mutex);
 }
 
 // Find first available /dev/video* device
@@ -155,6 +219,36 @@ static enum MHD_Result handle_get_devices(struct MHD_Connection *connection) {
 
     json_t *root = json_object();
     json_object_set_new(root, "devices", array);
+    char *json_str = json_dumps(root, 0);
+    json_decref(root);
+
+    enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
+    free(json_str);
+    return ret;
+}
+
+static enum MHD_Result handle_get_stats(struct MHD_Connection *connection, CustomData *data) {
+    g_mutex_lock(&data->stats.stats_mutex);
+    
+    // Calculate current bitrate
+    GstClockTime current_time = gst_clock_get_time(gst_system_clock_obtain());
+    GstClockTime elapsed = current_time - data->stats.start_time;
+    gdouble elapsed_seconds = (gdouble)elapsed / GST_SECOND;
+    
+    gdouble current_bitrate = 0.0;
+    if (elapsed_seconds > 0) {
+        current_bitrate = (data->stats.total_bytes * 8.0) / (elapsed_seconds * 1000.0); // kbps
+    }
+    
+    json_t *root = json_object();
+    json_object_set_new(root, "total_bytes", json_integer(data->stats.total_bytes));
+    json_object_set_new(root, "frame_count", json_integer(data->stats.frame_count));
+    json_object_set_new(root, "current_bitrate_kbps", json_real(current_bitrate));
+    json_object_set_new(root, "average_latency_ms", json_real(data->stats.average_latency));
+    json_object_set_new(root, "elapsed_time_seconds", json_real(elapsed_seconds));
+    
+    g_mutex_unlock(&data->stats.stats_mutex);
+
     char *json_str = json_dumps(root, 0);
     json_decref(root);
 
@@ -274,6 +368,7 @@ static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *co
         if (0 == strcmp(url, "/health")) return handle_health_check(connection);
         if (0 == strcmp(url, "/config")) return handle_get_config(connection, data);
         if (0 == strcmp(url, "/devices")) return handle_get_devices(connection);
+        if (0 == strcmp(url, "/stats")) return handle_get_stats(connection, data);
     }
 
     if (0 == strcmp(method, "POST") && 0 == strcmp(url, "/config")) {
@@ -444,6 +539,13 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     sink = gst_element_factory_make("udpsink", "sink");
     g_object_set(sink, "host", data->config.host, "port", data->config.port, "sync", FALSE, "async", FALSE, NULL);
 
+    // Add probe to monitor data flow for statistics
+    GstPad *sink_pad = gst_element_get_static_pad(sink, "sink");
+    if (sink_pad) {
+        gst_pad_add_probe(sink_pad, GST_PAD_PROBE_TYPE_BUFFER, udpsink_probe_callback, data, NULL);
+        gst_object_unref(sink_pad);
+    }
+
     gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL);
 
     if (!gst_element_link_many(src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL)) {
@@ -452,6 +554,16 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     }
 
     g_print("Pipeline built successfully. Starting...\n");
+    
+    // Reset statistics for new pipeline
+    g_mutex_lock(&data->stats.stats_mutex);
+    data->stats.total_bytes = 0;
+    data->stats.frame_count = 0;
+    data->stats.current_bitrate = 0.0;
+    data->stats.average_latency = 0.0;
+    data->stats.start_time = gst_clock_get_time(gst_system_clock_obtain());
+    g_mutex_unlock(&data->stats.stats_mutex);
+    
     gst_element_set_state(data->pipeline, GST_STATE_PLAYING);
     
     // Get the bus after the pipeline is created and started
@@ -483,6 +595,7 @@ int main(int argc, char *argv[]) {
 
     memset(&data, 0, sizeof(data));
     init_config(&data.config);
+    init_stats(&data.stats);
     g_mutex_init(&data.state_mutex);
     data.should_terminate = FALSE;
 
@@ -591,6 +704,7 @@ int main(int argc, char *argv[]) {
     }
     g_mutex_unlock(&data.state_mutex);
     free_config_members(&data.config);
+    free_stats(&data.stats);
     g_mutex_clear(&data.state_mutex);
 
     return 0;
