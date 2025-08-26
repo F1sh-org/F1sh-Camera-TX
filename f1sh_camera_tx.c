@@ -21,7 +21,7 @@
 #define DEFAULT_WIDTH 1280
 #define DEFAULT_HEIGHT 720
 #define DEFAULT_FRAMERATE 60
-#define DEFAULT_AUTOFOCUS TRUE
+#define DEFAULT_AUTOFOCUS FALSE
 
 // Application data structure
 typedef struct _AppConfig {
