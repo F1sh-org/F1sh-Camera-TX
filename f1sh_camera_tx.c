@@ -115,25 +115,28 @@ udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *in
         data->stats.total_bytes += buffer_size;
         data->stats.frame_count++;
         
-        // Calculate actual frame rate
-        GstClockTime current_time = g_get_monotonic_time() * 1000; // nanoseconds
+        // Calculate actual frame rate using system time
+        GstClockTime current_time = g_get_monotonic_time(); // microseconds
         
         if (data->stats.last_frame_time != 0) {
-            GstClockTime time_diff = current_time - data->stats.last_frame_time;
-            if (time_diff > 0) {
-                gdouble instant_fps = (gdouble)GST_SECOND / time_diff;
+            // Calculate time difference in microseconds
+            GstClockTime time_diff_us = current_time - data->stats.last_frame_time;
+            
+            if (time_diff_us > 0) {
+                // Convert to frames per second
+                gdouble instant_fps = 1000000.0 / time_diff_us; // 1 second = 1,000,000 microseconds
                 
-                // Update moving average of actual framerate
+                // Update moving average of actual framerate (smooth over multiple frames)
                 if (data->stats.actual_framerate == 0.0) {
                     data->stats.actual_framerate = instant_fps;
                 } else {
-                    data->stats.actual_framerate = (data->stats.actual_framerate * 0.9) + (instant_fps * 0.1);
+                    // Use exponential moving average with stronger smoothing
+                    data->stats.actual_framerate = (data->stats.actual_framerate * 0.95) + (instant_fps * 0.05);
                 }
                 
-                // Calculate "buffer fullness" as performance metric
-                // If actual FPS < configured FPS, we might be experiencing latency/buffering
+                // Calculate buffer performance as ratio of actual vs target framerate
                 gdouble fps_ratio = data->stats.actual_framerate / data->config.framerate;
-                data->stats.buffer_fullness = CLAMP(fps_ratio * 100.0, 0.0, 100.0);
+                data->stats.buffer_fullness = CLAMP(fps_ratio * 100.0, 0.0, 150.0); // Cap at 150%
             }
         }
         
@@ -284,7 +287,12 @@ static enum MHD_Result handle_get_stats(struct MHD_Connection *connection, Custo
     
     // Performance metrics
     gdouble target_fps = data->config.framerate;
-    gdouble fps_efficiency = (target_fps > 0) ? (data->stats.actual_framerate / target_fps) * 100.0 : 0.0;
+    gdouble fps_efficiency = 0.0;
+    if (target_fps > 0 && data->stats.actual_framerate > 0) {
+        fps_efficiency = (data->stats.actual_framerate / target_fps) * 100.0;
+        // Clamp efficiency to reasonable bounds
+        fps_efficiency = CLAMP(fps_efficiency, 0.0, 200.0);
+    }
     json_object_set_new(root, "target_framerate", json_real(target_fps));
     json_object_set_new(root, "framerate_efficiency_percent", json_real(fps_efficiency));
     
