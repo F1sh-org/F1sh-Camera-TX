@@ -79,7 +79,7 @@ void free_config_members(AppConfig *config) {
 }
 
 // Find first available /dev/video* device
-gchar* find_video_device() {
+gchar* find_video_device(void) {
     glob_t glob_result;
     memset(&glob_result, 0, sizeof(glob_result));
 
@@ -170,7 +170,6 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     AppConfig new_config = data->config;
 
     json_t *value;
-    const char *str_val;
 
     value = json_object_get(root, "host");
     if (json_is_string(value)) new_config.host = g_strdup(json_string_value(value));
@@ -203,7 +202,7 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
 
 static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *connection,
                                             const char *url, const char *method,
-                                            const char *version, const char *upload_data,
+                                            const char *version __attribute__((unused)), const char *upload_data,
                                             size_t *upload_data_size, void **con_cls) {
     CustomData *data = (CustomData *)cls;
 
@@ -248,8 +247,8 @@ static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *co
     return send_json_response(connection, "{\"error\":\"Not Found\"}", MHD_HTTP_NOT_FOUND);
 }
 
-static void request_completed(void *cls, struct MHD_Connection *connection,
-                              void **con_cls, enum MHD_RequestTerminationCode toe) {
+static void request_completed(void *cls __attribute__((unused)), struct MHD_Connection *connection __attribute__((unused)),
+                              void **con_cls, enum MHD_RequestTerminationCode toe __attribute__((unused))) {
     struct connection_info_struct *con_info = *con_cls;
     if (NULL == con_info || con_info == (void *)1) return;
     if (con_info->json_data) free(con_info->json_data);
@@ -275,7 +274,7 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         return FALSE;
     }
 
-    GstElement *src, *capsfilter, *encoder, *parser, *payloader, *sink;
+    GstElement *src, *capsfilter, *videoconvert, *encoder, *parser, *payloader, *sink;
     GstCaps *caps;
 
     src = gst_element_factory_make(data->config.src_type, "source");
@@ -292,6 +291,9 @@ static gboolean build_and_run_pipeline(CustomData *data) {
             g_object_set(src, "device", device_path, NULL);
             if (strlen(data->config.device) == 0) g_free(device_path);
         }
+    } else if (strcmp(data->config.src_type, "libcamerasrc") == 0) {
+        // Optimize libcamerasrc for low latency and memory usage
+        g_object_set(src, "camera-name", "/base/soc/i2c0mux/i2c@1/imx708@1a", NULL);
     }
 
     capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
@@ -301,23 +303,57 @@ static gboolean build_and_run_pipeline(CustomData *data) {
                                "framerate", GST_TYPE_FRACTION, data->config.framerate, 1,
                                NULL);
     if (strcmp(data->config.src_type, "libcamerasrc") == 0) {
-        gst_caps_set_simple(caps, "format", G_TYPE_STRING, "YUY2",
-                                  "colorimetry", G_TYPE_STRING, "bt709",
-                                  "interlace-mode", G_TYPE_STRING, "progressive", NULL);
+        // Use I420 format for better compatibility with hardware encoders
+        gst_caps_set_simple(caps, "format", G_TYPE_STRING, "I420", NULL);
     }
     g_object_set(capsfilter, "caps", caps, NULL);
     gst_caps_unref(caps);
 
-    encoder = gst_element_factory_make(data->config.encoder_type, "encoder");
-    if (!encoder) {
-        g_printerr("Failed to create encoder: %s.\n", data->config.encoder_type);
+    // Add videoconvert for format conversion
+    videoconvert = gst_element_factory_make("videoconvert", "videoconvert");
+    if (!videoconvert) {
+        g_printerr("Failed to create videoconvert element.\n");
         goto error;
     }
-    if (strcmp(data->config.encoder_type, "x264enc") == 0) {
-        g_object_set(encoder, "tune", 0x00000004, "speed-preset", 1, "bitrate", 2048, NULL);
-    } else if (strcmp(data->config.encoder_type, "v4l2h264enc") == 0) {
-        GstStructure *ctrls = gst_structure_new("controls", "repeat_sequence_header", G_TYPE_BOOLEAN, TRUE, NULL);
+
+    encoder = gst_element_factory_make(data->config.encoder_type, "encoder");
+    if (!encoder) {
+        g_printerr("Failed to create encoder: %s. Trying fallback encoder...\n", data->config.encoder_type);
+        // Try fallback encoders
+        if (strcmp(data->config.encoder_type, "v4l2h264enc") == 0) {
+            encoder = gst_element_factory_make("x264enc", "encoder");
+            if (encoder) {
+                g_print("Using x264enc as fallback encoder.\n");
+                g_object_set(encoder, "tune", 0x00000004, "speed-preset", 1, "bitrate", 2048, "threads", 1, NULL);
+            }
+        } else if (strcmp(data->config.encoder_type, "x264enc") == 0) {
+            encoder = gst_element_factory_make("v4l2h264enc", "encoder");
+            if (encoder) {
+                g_print("Using v4l2h264enc as fallback encoder.\n");
+            }
+        }
+        
+        if (!encoder) {
+            g_printerr("No suitable encoder found.\n");
+            goto error;
+        }
+    }
+    
+    if (strcmp(data->config.encoder_type, "x264enc") == 0 || 
+        (gst_element_get_factory(encoder) && 
+         strcmp(GST_OBJECT_NAME(gst_element_get_factory(encoder)), "x264enc") == 0)) {
+        g_object_set(encoder, "tune", 0x00000004, "speed-preset", 1, "bitrate", 2048, "threads", 1, NULL);
+    } else if (strcmp(data->config.encoder_type, "v4l2h264enc") == 0 ||
+               (gst_element_get_factory(encoder) && 
+                strcmp(GST_OBJECT_NAME(gst_element_get_factory(encoder)), "v4l2h264enc") == 0)) {
+        // Optimized settings for Raspberry Pi v4l2h264enc
+        GstStructure *ctrls = gst_structure_new("controls", 
+                                               "repeat_sequence_header", G_TYPE_BOOLEAN, TRUE,
+                                               "h264_profile", G_TYPE_INT, 1, // Baseline profile
+                                               "video_bitrate", G_TYPE_INT, 2000000, // 2Mbps
+                                               NULL);
         g_object_set(encoder, "extra-controls", ctrls, NULL);
+        gst_structure_free(ctrls);
     }
 
     parser = gst_element_factory_make("h264parse", "parser");
@@ -327,9 +363,9 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     sink = gst_element_factory_make("udpsink", "sink");
     g_object_set(sink, "host", data->config.host, "port", data->config.port, "sync", FALSE, "async", FALSE, NULL);
 
-    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, encoder, parser, payloader, sink, NULL);
+    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, videoconvert, encoder, parser, payloader, sink, NULL);
 
-    if (!gst_element_link_many(src, capsfilter, encoder, parser, payloader, sink, NULL)) {
+    if (!gst_element_link_many(src, capsfilter, videoconvert, encoder, parser, payloader, sink, NULL)) {
         g_printerr("Failed to link elements.\n");
         goto error;
     }
