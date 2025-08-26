@@ -45,6 +45,7 @@ typedef struct _StreamStats {
     gdouble average_latency;    // ms
     GstClockTime last_timestamp;
     GstClockTime start_time;
+    GstClockTime last_buffer_time; // For latency calculation
     GMutex stats_mutex;
 } StreamStats;
 
@@ -76,6 +77,28 @@ static void request_completed(void *cls, struct MHD_Connection *connection,
 static gboolean build_and_run_pipeline(CustomData *data);
 static void free_config_members(AppConfig *config);
 
+// Probe callback on source to timestamp buffers
+static GstPadProbeReturn
+source_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *info, gpointer user_data __attribute__((unused)))
+{
+    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    
+    if (buffer) {
+        // Add a custom timestamp as metadata to track when buffer was created
+        GstClockTime current_time = g_get_monotonic_time() * 1000; // Convert microseconds to nanoseconds
+        
+        // Create a new buffer with the timestamp metadata
+        buffer = gst_buffer_make_writable(buffer);
+        
+        // Store the capture time as a custom meta or just use the DTS field
+        GST_BUFFER_DTS(buffer) = current_time;
+        
+        GST_PAD_PROBE_INFO_DATA(info) = buffer;
+    }
+    
+    return GST_PAD_PROBE_OK;
+}
+
 // Probe callback to monitor data flow
 static GstPadProbeReturn
 udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *info, gpointer user_data)
@@ -91,19 +114,22 @@ udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *in
         data->stats.total_bytes += buffer_size;
         data->stats.frame_count++;
         
-        // Calculate latency (simplified - time since buffer creation to now)
-        GstClockTime buffer_pts = GST_BUFFER_PTS(buffer);
-        GstClockTime current_time = gst_clock_get_time(gst_system_clock_obtain());
+        // Calculate latency using our custom timestamp
+        GstClockTime buffer_dts = GST_BUFFER_DTS(buffer);
+        GstClockTime current_time = g_get_monotonic_time() * 1000; // Convert to nanoseconds
         
-        if (GST_CLOCK_TIME_IS_VALID(buffer_pts)) {
-            GstClockTime latency = current_time - buffer_pts;
+        if (GST_CLOCK_TIME_IS_VALID(buffer_dts)) {
+            GstClockTime latency = current_time - buffer_dts;
             gdouble latency_ms = (gdouble)latency / GST_MSECOND;
             
-            // Simple moving average for latency
-            if (data->stats.average_latency == 0.0) {
-                data->stats.average_latency = latency_ms;
-            } else {
-                data->stats.average_latency = (data->stats.average_latency * 0.9) + (latency_ms * 0.1);
+            // Only use reasonable latency values (0-500ms for video streaming)
+            if (latency_ms >= 0 && latency_ms <= 500.0) {
+                // Simple moving average for latency
+                if (data->stats.average_latency == 0.0) {
+                    data->stats.average_latency = latency_ms;
+                } else {
+                    data->stats.average_latency = (data->stats.average_latency * 0.9) + (latency_ms * 0.1);
+                }
             }
         }
         
@@ -142,6 +168,7 @@ void init_stats(StreamStats *stats) {
     stats->average_latency = 0.0;
     stats->last_timestamp = 0;
     stats->start_time = gst_clock_get_time(gst_system_clock_obtain());
+    stats->last_buffer_time = 0;
     g_mutex_init(&stats->stats_mutex);
 }
 
@@ -470,6 +497,13 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         }
     }
 
+    // Add probe to source to timestamp buffers for latency measurement
+    GstPad *src_pad = gst_element_get_static_pad(src, "src");
+    if (src_pad) {
+        gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_BUFFER, source_probe_callback, data, NULL);
+        gst_object_unref(src_pad);
+    }
+
     capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
     caps = gst_caps_new_simple("video/x-raw",
                                "width", G_TYPE_INT, data->config.width,
@@ -562,6 +596,7 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     data->stats.current_bitrate = 0.0;
     data->stats.average_latency = 0.0;
     data->stats.start_time = gst_clock_get_time(gst_system_clock_obtain());
+    data->stats.last_buffer_time = 0;
     g_mutex_unlock(&data->stats.stats_mutex);
     
     gst_element_set_state(data->pipeline, GST_STATE_PLAYING);
