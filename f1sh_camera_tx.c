@@ -36,10 +36,12 @@ typedef struct _AppConfig {
 
 typedef struct _CustomData {
     GstElement *pipeline;
+    GstBus *bus;
     struct MHD_Daemon *daemon;
     AppConfig config;
     GMutex state_mutex;
     gboolean pipeline_is_restarting;
+    gboolean should_terminate;
 } CustomData;
 
 // Structure to hold the connection-specific data for POST requests
@@ -260,11 +262,16 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     g_mutex_lock(&data->state_mutex);
     g_print("Building pipeline...\n");
 
+    // Stop and cleanup existing pipeline
     if (data->pipeline) {
         g_print("Stopping existing pipeline.\n");
         gst_element_set_state(data->pipeline, GST_STATE_NULL);
         gst_object_unref(data->pipeline);
         data->pipeline = NULL;
+    }
+    if (data->bus) {
+        gst_object_unref(data->bus);
+        data->bus = NULL;
     }
 
     data->pipeline = gst_pipeline_new("video-stream-pipeline");
@@ -374,6 +381,10 @@ static gboolean build_and_run_pipeline(CustomData *data) {
 
     g_print("Pipeline built successfully. Starting...\n");
     gst_element_set_state(data->pipeline, GST_STATE_PLAYING);
+    
+    // Get the bus after the pipeline is created and started
+    data->bus = gst_element_get_bus(data->pipeline);
+    
     g_mutex_unlock(&data->state_mutex);
     return TRUE;
 
@@ -383,6 +394,10 @@ error:
         gst_object_unref(data->pipeline);
         data->pipeline = NULL;
     }
+    if (data->bus) {
+        gst_object_unref(data->bus);
+        data->bus = NULL;
+    }
     g_mutex_unlock(&data->state_mutex);
     return FALSE;
 }
@@ -391,13 +406,13 @@ int main(int argc, char *argv[]) {
     CustomData data;
     GstBus *bus;
     GstMessage *msg;
-    gboolean terminate = FALSE;
 
     gst_init(&argc, &argv);
 
     memset(&data, 0, sizeof(data));
     init_config(&data.config);
     g_mutex_init(&data.state_mutex);
+    data.should_terminate = FALSE;
 
     if (strlen(data.config.device) == 0 && (strcmp(data.config.src_type, "v4l2src") == 0)) {
         gchar *found_device = find_video_device();
@@ -426,58 +441,83 @@ int main(int argc, char *argv[]) {
     g_print("HTTP server started on port %d\n", HTTP_PORT);
 
     do {
-        bus = gst_element_get_bus(data.pipeline);
-        msg = gst_bus_timed_pop_filtered(bus, 100 * GST_MSECOND,
-                                         GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_STATE_CHANGED);
-
-        if (msg != NULL) {
-            GError *err;
-            gchar *debug_info;
-            switch (GST_MESSAGE_TYPE(msg)) {
-                case GST_MESSAGE_ERROR:
-                    gst_message_parse_error(msg, &err, &debug_info);
-                    g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
-                    g_printerr("Debugging info: %s\n", debug_info ? debug_info : "none");
-                    g_clear_error(&err);
-                    g_free(debug_info);
-                    terminate = TRUE;
-                    break;
-                case GST_MESSAGE_EOS:
-                    g_print("End-Of-Stream reached.\n");
-                    terminate = TRUE;
-                    break;
-                case GST_MESSAGE_STATE_CHANGED:
-                    if (GST_MESSAGE_SRC(msg) == GST_OBJECT(data.pipeline)) {
-                        GstState old_state, new_state, pending_state;
-                        gst_message_parse_state_changed(msg, &old_state, &new_state, &pending_state);
-                        g_print("Pipeline state changed from %s to %s\n",
-                                gst_element_state_get_name(old_state), gst_element_state_get_name(new_state));
-                    }
-                    break;
-                default:
-                    break;
-            }
-            gst_message_unref(msg);
-        }
-        gst_object_unref(bus);
-
         g_mutex_lock(&data.state_mutex);
+        
+        // Check if we should terminate
+        if (data.should_terminate) {
+            g_mutex_unlock(&data.state_mutex);
+            break;
+        }
+        
+        // Check if pipeline restart is needed
         if (data.pipeline_is_restarting) {
             data.pipeline_is_restarting = FALSE;
             g_mutex_unlock(&data.state_mutex);
             build_and_run_pipeline(&data);
+            continue;
+        }
+        
+        // Get bus reference safely
+        bus = data.bus;
+        if (bus) {
+            gst_object_ref(bus);
+        }
+        g_mutex_unlock(&data.state_mutex);
+        
+        if (bus) {
+            msg = gst_bus_timed_pop_filtered(bus, 100 * GST_MSECOND,
+                                             GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_STATE_CHANGED);
+
+            if (msg != NULL) {
+                GError *err;
+                gchar *debug_info;
+                switch (GST_MESSAGE_TYPE(msg)) {
+                    case GST_MESSAGE_ERROR:
+                        gst_message_parse_error(msg, &err, &debug_info);
+                        g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
+                        g_printerr("Debugging info: %s\n", debug_info ? debug_info : "none");
+                        g_clear_error(&err);
+                        g_free(debug_info);
+                        data.should_terminate = TRUE;
+                        break;
+                    case GST_MESSAGE_EOS:
+                        g_print("End-Of-Stream reached.\n");
+                        data.should_terminate = TRUE;
+                        break;
+                    case GST_MESSAGE_STATE_CHANGED:
+                        g_mutex_lock(&data.state_mutex);
+                        if (data.pipeline && GST_MESSAGE_SRC(msg) == GST_OBJECT(data.pipeline)) {
+                            GstState old_state, new_state, pending_state;
+                            gst_message_parse_state_changed(msg, &old_state, &new_state, &pending_state);
+                            g_print("Pipeline state changed from %s to %s\n",
+                                    gst_element_state_get_name(old_state), gst_element_state_get_name(new_state));
+                        }
+                        g_mutex_unlock(&data.state_mutex);
+                        break;
+                    default:
+                        break;
+                }
+                gst_message_unref(msg);
+            }
+            gst_object_unref(bus);
         } else {
-            g_mutex_unlock(&data.state_mutex);
+            // No bus available, just wait a bit
+            g_usleep(100000); // 100ms
         }
 
-    } while (!terminate);
+    } while (!data.should_terminate);
 
     // Cleanup
     MHD_stop_daemon(data.daemon);
+    g_mutex_lock(&data.state_mutex);
     if (data.pipeline) {
         gst_element_set_state(data.pipeline, GST_STATE_NULL);
         gst_object_unref(data.pipeline);
     }
+    if (data.bus) {
+        gst_object_unref(data.bus);
+    }
+    g_mutex_unlock(&data.state_mutex);
     free_config_members(&data.config);
     g_mutex_clear(&data.state_mutex);
 
