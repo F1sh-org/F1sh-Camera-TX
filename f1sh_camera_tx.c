@@ -115,32 +115,25 @@ udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *in
         data->stats.total_bytes += buffer_size;
         data->stats.frame_count++;
         
-        // Calculate actual frame rate using system time
+        // Calculate average framerate over the entire streaming session
         GstClockTime current_time = g_get_monotonic_time(); // microseconds
         
-        if (data->stats.last_frame_time != 0) {
-            // Calculate time difference in microseconds
-            GstClockTime time_diff_us = current_time - data->stats.last_frame_time;
-            
-            if (time_diff_us > 0) {
-                // Convert to frames per second
-                gdouble instant_fps = 1000000.0 / time_diff_us; // 1 second = 1,000,000 microseconds
-                
-                // Update moving average of actual framerate (smooth over multiple frames)
-                if (data->stats.actual_framerate == 0.0) {
-                    data->stats.actual_framerate = instant_fps;
-                } else {
-                    // Use exponential moving average with stronger smoothing
-                    data->stats.actual_framerate = (data->stats.actual_framerate * 0.95) + (instant_fps * 0.05);
-                }
+        if (data->stats.last_frame_time == 0) {
+            // First frame - just record the time
+            data->stats.last_frame_time = current_time;
+        } else if (data->stats.frame_count > 10) { // Only calculate after we have some frames
+            // Calculate average FPS since streaming started
+            GstClockTime total_time_us = current_time - data->stats.last_frame_time;
+            if (total_time_us > 0) {
+                // Average FPS = (frames - 1) / time_elapsed_seconds
+                gdouble time_elapsed_seconds = (gdouble)total_time_us / 1000000.0;
+                data->stats.actual_framerate = (gdouble)(data->stats.frame_count - 1) / time_elapsed_seconds;
                 
                 // Calculate buffer performance as ratio of actual vs target framerate
                 gdouble fps_ratio = data->stats.actual_framerate / data->config.framerate;
                 data->stats.buffer_fullness = CLAMP(fps_ratio * 100.0, 0.0, 150.0); // Cap at 150%
             }
         }
-        
-        data->stats.last_frame_time = current_time;
         
         g_mutex_unlock(&data->stats.stats_mutex);
     }
@@ -618,7 +611,7 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     data->stats.current_bitrate = 0.0;
     data->stats.actual_framerate = 0.0;
     data->stats.buffer_fullness = 0.0;
-    data->stats.last_frame_time = 0;
+    data->stats.last_frame_time = 0; // Will be set on first frame
     data->stats.start_time = gst_clock_get_time(gst_system_clock_obtain());
     g_mutex_unlock(&data->stats.stats_mutex);
     
