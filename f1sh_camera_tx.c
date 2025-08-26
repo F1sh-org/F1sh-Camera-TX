@@ -168,31 +168,59 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     CustomData *data = con_info->custom_data;
     g_mutex_lock(&data->state_mutex);
 
-    // Create a temporary config to hold new values
-    AppConfig new_config = data->config;
-
     json_t *value;
+    const char *str_val;
 
     value = json_object_get(root, "host");
-    if (json_is_string(value)) new_config.host = g_strdup(json_string_value(value));
+    if (json_is_string(value)) {
+        str_val = json_string_value(value);
+        g_free(data->config.host);
+        data->config.host = g_strdup(str_val);
+    }
+    
     value = json_object_get(root, "port");
-    if (json_is_integer(value)) new_config.port = json_integer_value(value);
+    if (json_is_integer(value)) {
+        data->config.port = json_integer_value(value);
+    }
+    
     value = json_object_get(root, "src");
-    if (json_is_string(value)) new_config.src_type = g_strdup(json_string_value(value));
+    if (json_is_string(value)) {
+        str_val = json_string_value(value);
+        g_free(data->config.src_type);
+        data->config.src_type = g_strdup(str_val);
+    }
+    
     value = json_object_get(root, "device");
-    if (json_is_string(value)) new_config.device = g_strdup(json_string_value(value));
+    if (json_is_string(value)) {
+        str_val = json_string_value(value);
+        g_free(data->config.device);
+        data->config.device = g_strdup(str_val);
+    }
+    
     value = json_object_get(root, "encoder");
-    if (json_is_string(value)) new_config.encoder_type = g_strdup(json_string_value(value));
+    if (json_is_string(value)) {
+        str_val = json_string_value(value);
+        g_free(data->config.encoder_type);
+        data->config.encoder_type = g_strdup(str_val);
+    }
+    
     value = json_object_get(root, "width");
-    if (json_is_integer(value)) new_config.width = json_integer_value(value);
+    if (json_is_integer(value)) {
+        data->config.width = json_integer_value(value);
+    }
+    
     value = json_object_get(root, "height");
-    if (json_is_integer(value)) new_config.height = json_integer_value(value);
+    if (json_is_integer(value)) {
+        data->config.height = json_integer_value(value);
+    }
+    
     value = json_object_get(root, "framerate");
-    if (json_is_integer(value)) new_config.framerate = json_integer_value(value);
+    if (json_is_integer(value)) {
+        data->config.framerate = json_integer_value(value);
+    }
 
-    // Free old members and assign the new config
-    free_config_members(&data->config);
-    data->config = new_config;
+    g_print("Configuration updated: host=%s, port=%d, src=%s, encoder=%s\n", 
+            data->config.host, data->config.port, data->config.src_type, data->config.encoder_type);
     
     data->pipeline_is_restarting = TRUE;
 
