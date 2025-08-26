@@ -41,11 +41,12 @@ typedef struct _AppConfig {
 typedef struct _StreamStats {
     guint64 total_bytes;
     guint64 frame_count;
-    gdouble current_bitrate;    // kbps
-    gdouble average_latency;    // ms
+    gdouble current_bitrate;        // kbps
+    gdouble actual_framerate;       // fps
+    gdouble buffer_fullness;        // percentage (0-100)
     GstClockTime last_timestamp;
     GstClockTime start_time;
-    GstClockTime last_buffer_time; // For latency calculation
+    GstClockTime last_frame_time;
     GMutex stats_mutex;
 } StreamStats;
 
@@ -114,24 +115,29 @@ udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *in
         data->stats.total_bytes += buffer_size;
         data->stats.frame_count++;
         
-        // Calculate latency using our custom timestamp
-        GstClockTime buffer_dts = GST_BUFFER_DTS(buffer);
-        GstClockTime current_time = g_get_monotonic_time() * 1000; // Convert to nanoseconds
+        // Calculate actual frame rate
+        GstClockTime current_time = g_get_monotonic_time() * 1000; // nanoseconds
         
-        if (GST_CLOCK_TIME_IS_VALID(buffer_dts)) {
-            GstClockTime latency = current_time - buffer_dts;
-            gdouble latency_ms = (gdouble)latency / GST_MSECOND;
-            
-            // Only use reasonable latency values (0-500ms for video streaming)
-            if (latency_ms >= 0 && latency_ms <= 500.0) {
-                // Simple moving average for latency
-                if (data->stats.average_latency == 0.0) {
-                    data->stats.average_latency = latency_ms;
+        if (data->stats.last_frame_time != 0) {
+            GstClockTime time_diff = current_time - data->stats.last_frame_time;
+            if (time_diff > 0) {
+                gdouble instant_fps = (gdouble)GST_SECOND / time_diff;
+                
+                // Update moving average of actual framerate
+                if (data->stats.actual_framerate == 0.0) {
+                    data->stats.actual_framerate = instant_fps;
                 } else {
-                    data->stats.average_latency = (data->stats.average_latency * 0.9) + (latency_ms * 0.1);
+                    data->stats.actual_framerate = (data->stats.actual_framerate * 0.9) + (instant_fps * 0.1);
                 }
+                
+                // Calculate "buffer fullness" as performance metric
+                // If actual FPS < configured FPS, we might be experiencing latency/buffering
+                gdouble fps_ratio = data->stats.actual_framerate / data->config.framerate;
+                data->stats.buffer_fullness = CLAMP(fps_ratio * 100.0, 0.0, 100.0);
             }
         }
+        
+        data->stats.last_frame_time = current_time;
         
         g_mutex_unlock(&data->stats.stats_mutex);
     }
@@ -165,10 +171,11 @@ void init_stats(StreamStats *stats) {
     stats->total_bytes = 0;
     stats->frame_count = 0;
     stats->current_bitrate = 0.0;
-    stats->average_latency = 0.0;
+    stats->actual_framerate = 0.0;
+    stats->buffer_fullness = 0.0;
     stats->last_timestamp = 0;
     stats->start_time = gst_clock_get_time(gst_system_clock_obtain());
-    stats->last_buffer_time = 0;
+    stats->last_frame_time = 0;
     g_mutex_init(&stats->stats_mutex);
 }
 
@@ -271,8 +278,15 @@ static enum MHD_Result handle_get_stats(struct MHD_Connection *connection, Custo
     json_object_set_new(root, "total_bytes", json_integer(data->stats.total_bytes));
     json_object_set_new(root, "frame_count", json_integer(data->stats.frame_count));
     json_object_set_new(root, "current_bitrate_kbps", json_real(current_bitrate));
-    json_object_set_new(root, "average_latency_ms", json_real(data->stats.average_latency));
+    json_object_set_new(root, "actual_framerate", json_real(data->stats.actual_framerate));
+    json_object_set_new(root, "buffer_fullness_percent", json_real(data->stats.buffer_fullness));
     json_object_set_new(root, "elapsed_time_seconds", json_real(elapsed_seconds));
+    
+    // Performance metrics
+    gdouble target_fps = data->config.framerate;
+    gdouble fps_efficiency = (target_fps > 0) ? (data->stats.actual_framerate / target_fps) * 100.0 : 0.0;
+    json_object_set_new(root, "target_framerate", json_real(target_fps));
+    json_object_set_new(root, "framerate_efficiency_percent", json_real(fps_efficiency));
     
     g_mutex_unlock(&data->stats.stats_mutex);
 
@@ -594,9 +608,10 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     data->stats.total_bytes = 0;
     data->stats.frame_count = 0;
     data->stats.current_bitrate = 0.0;
-    data->stats.average_latency = 0.0;
+    data->stats.actual_framerate = 0.0;
+    data->stats.buffer_fullness = 0.0;
+    data->stats.last_frame_time = 0;
     data->stats.start_time = gst_clock_get_time(gst_system_clock_obtain());
-    data->stats.last_buffer_time = 0;
     g_mutex_unlock(&data->stats.stats_mutex);
     
     gst_element_set_state(data->pipeline, GST_STATE_PLAYING);
