@@ -21,6 +21,7 @@
 #define DEFAULT_WIDTH 1280
 #define DEFAULT_HEIGHT 720
 #define DEFAULT_FRAMERATE 60
+#define DEFAULT_AUTOFOCUS TRUE
 
 // Application data structure
 typedef struct _AppConfig {
@@ -32,6 +33,7 @@ typedef struct _AppConfig {
     gint width;
     gint height;
     gint framerate;
+    gboolean autofocus;
 } AppConfig;
 
 typedef struct _CustomData {
@@ -71,6 +73,7 @@ void init_config(AppConfig *config) {
     config->width = DEFAULT_WIDTH;
     config->height = DEFAULT_HEIGHT;
     config->framerate = DEFAULT_FRAMERATE;
+    config->autofocus = DEFAULT_AUTOFOCUS;
 }
 
 void free_config_members(AppConfig *config) {
@@ -127,6 +130,7 @@ static enum MHD_Result handle_get_config(struct MHD_Connection *connection, Cust
     json_object_set_new(root, "width", json_integer(data->config.width));
     json_object_set_new(root, "height", json_integer(data->config.height));
     json_object_set_new(root, "framerate", json_integer(data->config.framerate));
+    json_object_set_new(root, "autofocus", json_boolean(data->config.autofocus));
     g_mutex_unlock(&data->state_mutex);
 
     char *json_str = json_dumps(root, 0);
@@ -219,8 +223,14 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         data->config.framerate = json_integer_value(value);
     }
 
-    g_print("Configuration updated: host=%s, port=%d, src=%s, encoder=%s\n", 
-            data->config.host, data->config.port, data->config.src_type, data->config.encoder_type);
+    value = json_object_get(root, "autofocus");
+    if (json_is_boolean(value)) {
+        data->config.autofocus = json_boolean_value(value);
+    }
+
+    g_print("Configuration updated: host=%s, port=%d, src=%s, encoder=%s, autofocus=%s\n", 
+            data->config.host, data->config.port, data->config.src_type, data->config.encoder_type,
+            data->config.autofocus ? "enabled" : "disabled");
     
     data->pipeline_is_restarting = TRUE;
 
@@ -329,6 +339,27 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     } else if (strcmp(data->config.src_type, "libcamerasrc") == 0) {
         // Optimize libcamerasrc for low latency and memory usage
         g_object_set(src, "camera-name", "/base/soc/i2c0mux/i2c@1/imx708@1a", NULL);
+        
+        // Configure autofocus for Camera Module 3
+        if (data->config.autofocus) {
+            g_print("Enabling autofocus for Camera Module 3\n");
+            
+            // Create controls structure for autofocus
+            GstStructure *controls = gst_structure_new("controls",
+                "AfMode", G_TYPE_INT, 2,  // Continuous autofocus mode
+                "AfTrigger", G_TYPE_INT, 0,  // Start autofocus
+                NULL);
+            g_object_set(src, "controls", controls, NULL);
+            gst_structure_free(controls);
+        } else {
+            g_print("Autofocus disabled\n");
+            // Set manual focus mode
+            GstStructure *controls = gst_structure_new("controls",
+                "AfMode", G_TYPE_INT, 0,  // Manual focus mode
+                NULL);
+            g_object_set(src, "controls", controls, NULL);
+            gst_structure_free(controls);
+        }
     }
 
     capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
