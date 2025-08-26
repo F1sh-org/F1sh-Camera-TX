@@ -8,26 +8,19 @@ Wants=network-online.target
 Type=simple
 User=pi
 Group=video
-WorkingDirectory=/opt/f1sh-camera-tx
-ExecStart=/opt/f1sh-camera-tx/F1sh-Camera-TX
+WorkingDirectory=/etc/f1sh-camera-tx
+ExecStart=/etc/f1sh-camera-tx/F1sh-Camera-TX
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
-# Environment variables
-Environment=GST_DEBUG=2
-Environment=GST_PLUGIN_PATH=/usr/lib/gstreamer-1.0
-
-# Resource limits
-LimitNOFILE=65536
-MemoryMax=512M
 
 # Security settings
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/opt/f1sh-camera-tx
+ReadWritePaths=/etc/f1sh-camera-tx
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

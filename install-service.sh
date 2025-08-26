@@ -13,10 +13,10 @@ fi
 
 # Configuration
 SERVICE_NAME="f1sh-camera-tx"
-INSTALL_DIR="/opt/f1sh-camera-tx"
+INSTALL_DIR="/etc/f1sh-camera-tx"
 BINARY_NAME="F1sh-Camera-TX"
 SERVICE_FILE="f1sh-camera-tx.service"
-BUILD_DIR="builddir"
+BUILD_DIR="build"
 
 echo "=== F1sh-Camera-TX Service Installation ==="
 echo "Installing to: $INSTALL_DIR"
