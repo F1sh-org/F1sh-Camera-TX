@@ -545,8 +545,9 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     // Try encoders in order of preference with better error handling
     const gchar *encoder_fallbacks[] = {
         data->config.encoder_type,  // First try the requested encoder
-        "x264enc",                  // Software fallback
-        "v4l2h264enc",             // Hardware encoder
+        "v4l2h264enc",             // Hardware encoder (Pi default)
+        "omxh264enc",              // OpenMAX encoder (Pi fallback)
+        "x264enc",                 // Software fallback
         "nvh264enc",               // NVIDIA if available
         "vaapih264enc",            // Intel VAAPI if available
         NULL
@@ -588,19 +589,16 @@ static gboolean build_and_run_pipeline(CustomData *data) {
                      "key-int-max", 30,   // GOP size
                      NULL);
     } else if (strcmp(actual_encoder_name, "v4l2h264enc") == 0) {
-        g_print("Configuring v4l2h264enc encoder\n");
-        // Use more conservative settings for v4l2h264enc
+        g_print("Configuring v4l2h264enc encoder with minimal settings\n");
+        // Use absolutely minimal settings - don't set any extra controls that might fail
+        // Let the encoder use its defaults
+        (void)encoder; // Just acknowledge we have the encoder, don't configure it
+    } else if (strcmp(actual_encoder_name, "omxh264enc") == 0) {
+        g_print("Configuring omxh264enc encoder\n");
         g_object_set(encoder,
-                     "output-io-mode", 2,  // GST_V4L2_IO_DMABUF
+                     "target-bitrate", 2048000,  // 2Mbps in bits/sec
+                     "control-rate", 2,          // variable bitrate
                      NULL);
-        
-        // Try to set extra controls but don't fail if it doesn't work
-        GstStructure *ctrls = gst_structure_new("controls", 
-                                               "repeat_sequence_header", G_TYPE_BOOLEAN, TRUE,
-                                               "h264_i_frame_period", G_TYPE_INT, 30,
-                                               NULL);
-        g_object_set(encoder, "extra-controls", ctrls, NULL);
-        gst_structure_free(ctrls);
     } else if (strcmp(actual_encoder_name, "nvh264enc") == 0) {
         g_print("Configuring nvh264enc encoder\n");
         g_object_set(encoder,
@@ -779,25 +777,13 @@ int main(int argc, char *argv[]) {
                         g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
                         g_printerr("Debugging info: %s\n", debug_info ? debug_info : "none");
                         
-                        // Check if the error is from the encoder and try fallback
+                        // Log encoder errors but don't auto-fallback to avoid infinite loops
                         if (strstr(GST_OBJECT_NAME(msg->src), "encoder")) {
-                            g_print("Encoder error detected. Attempting fallback to x264enc...\n");
-                            
-                            g_mutex_lock(&data.state_mutex);
-                            if (strcmp(data.config.encoder_type, "v4l2h264enc") == 0) {
-                                g_free(data.config.encoder_type);
-                                data.config.encoder_type = g_strdup("x264enc");
-                                data.pipeline_is_restarting = TRUE;
-                                g_print("Switching to x264enc software encoder\n");
-                            } else {
-                                g_print("Already using fallback encoder, terminating\n");
-                                data.should_terminate = TRUE;
-                            }
-                            g_mutex_unlock(&data.state_mutex);
-                        } else {
-                            data.should_terminate = TRUE;
+                            g_printerr("Encoder error detected. Consider using a different encoder via /config API.\n");
+                            g_printerr("Try: curl -X POST http://localhost:8888/config -d '{\"encoder\":\"x264enc\"}'\n");
                         }
                         
+                        data.should_terminate = TRUE;
                         g_clear_error(&err);
                         g_free(debug_info);
                         break;
