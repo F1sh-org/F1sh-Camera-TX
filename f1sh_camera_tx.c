@@ -81,6 +81,15 @@ source_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *inf
     GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
     
     if (buffer) {
+        static guint64 source_frame_count = 0;
+        source_frame_count++;
+        
+        // Print debug info every 30 frames
+        if (source_frame_count % 30 == 0) {
+            gsize buffer_size = gst_buffer_get_size(buffer);
+            g_print("Source output: frame %llu, size %zu bytes\n", (unsigned long long)source_frame_count, buffer_size);
+        }
+        
         // Add a custom timestamp as metadata to track when buffer was created
         GstClockTime current_time = g_get_monotonic_time() * 1000; // Convert microseconds to nanoseconds
         
@@ -525,11 +534,18 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         }
     }
 
+    // Try a simple test: if 1920x1080@60fps fails, try 1280x720@30fps
+    if (data->config.width == 1920 && data->config.height == 1080 && data->config.framerate == 60) {
+        g_print("High resolution/framerate detected. If pipeline fails, will try lower settings.\n");
+    }
+    
     // Add probe to source to timestamp buffers for latency measurement
     GstPad *src_pad = gst_element_get_static_pad(src, "src");
     if (src_pad) {
         gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_BUFFER, source_probe_callback, data, NULL);
         gst_object_unref(src_pad);
+    } else {
+        g_printerr("Warning: Could not get source pad for probe\n");
     }
 
     capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
@@ -713,6 +729,19 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     data->bus = gst_element_get_bus(data->pipeline);
     
     g_print("Pipeline started successfully, streaming to %s:%d\n", data->config.host, data->config.port);
+    
+    // Wait a moment and check if the pipeline is actually working
+    g_usleep(500000); // Wait 500ms
+    
+    GstState current_state, pending_state;
+    GstStateChangeReturn state_ret = gst_element_get_state(data->pipeline, &current_state, &pending_state, GST_CLOCK_TIME_NONE);
+    g_print("Pipeline state check: return=%d, current=%s, pending=%s\n", 
+            state_ret, gst_element_state_get_name(current_state), gst_element_state_get_name(pending_state));
+    
+    if (current_state != GST_STATE_PLAYING) {
+        g_printerr("Warning: Pipeline is not in PLAYING state after startup!\n");
+    }
+    
     g_mutex_unlock(&data->state_mutex);
     return TRUE;
 
@@ -806,7 +835,8 @@ int main(int argc, char *argv[]) {
         
         if (bus) {
             msg = gst_bus_timed_pop_filtered(bus, 100 * GST_MSECOND,
-                                             GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_STATE_CHANGED);
+                                             GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_STATE_CHANGED | 
+                                             GST_MESSAGE_WARNING | GST_MESSAGE_INFO);
 
             if (msg != NULL) {
                 GError *err;
@@ -819,6 +849,20 @@ int main(int argc, char *argv[]) {
                         g_clear_error(&err);
                         g_free(debug_info);
                         data.should_terminate = TRUE;
+                        break;
+                    case GST_MESSAGE_WARNING:
+                        gst_message_parse_warning(msg, &err, &debug_info);
+                        g_printerr("WARNING from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
+                        g_printerr("Warning info: %s\n", debug_info ? debug_info : "none");
+                        g_clear_error(&err);
+                        g_free(debug_info);
+                        break;
+                    case GST_MESSAGE_INFO:
+                        gst_message_parse_info(msg, &err, &debug_info);
+                        g_print("INFO from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
+                        g_print("Info details: %s\n", debug_info ? debug_info : "none");
+                        g_clear_error(&err);
+                        g_free(debug_info);
                         break;
                     case GST_MESSAGE_EOS:
                         g_print("End-Of-Stream reached.\n");
