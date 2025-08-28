@@ -307,17 +307,32 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     
     value = json_object_get(root, "width");
     if (json_is_integer(value)) {
-        data->config.width = json_integer_value(value);
+        int new_width = json_integer_value(value);
+        if (new_width >= 320 && new_width <= 4096) {
+            data->config.width = new_width;
+        } else {
+            g_print("Warning: Invalid width %d, keeping current value %d\n", new_width, data->config.width);
+        }
     }
     
     value = json_object_get(root, "height");
     if (json_is_integer(value)) {
-        data->config.height = json_integer_value(value);
+        int new_height = json_integer_value(value);
+        if (new_height >= 240 && new_height <= 2160) {
+            data->config.height = new_height;
+        } else {
+            g_print("Warning: Invalid height %d, keeping current value %d\n", new_height, data->config.height);
+        }
     }
     
     value = json_object_get(root, "framerate");
     if (json_is_integer(value)) {
-        data->config.framerate = json_integer_value(value);
+        int new_framerate = json_integer_value(value);
+        if (new_framerate >= 1 && new_framerate <= 120) {
+            data->config.framerate = new_framerate;
+        } else {
+            g_print("Warning: Invalid framerate %d, keeping current value %d\n", new_framerate, data->config.framerate);
+        }
     }
 
     value = json_object_get(root, "autofocus");
@@ -451,24 +466,36 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         if (data->config.autofocus) {
             g_print("Enabling autofocus for Camera Module 3\n");
             
-            // Use the correct libcamera control names for autofocus
-            GstStructure *controls = gst_structure_new("controls",
-                "AfMode", G_TYPE_INT, 2,           // AfModeContinuous
-                "AfSpeed", G_TYPE_INT, 1,          // Fast autofocus speed
-                "AfRange", G_TYPE_INT, 0,          // AfRangeNormal (full range)
-                "LensPosition", G_TYPE_FLOAT, 0.0, // Let AF control lens position
-                NULL);
-            g_object_set(src, "controls", controls, NULL);
-            gst_structure_free(controls);
+            // Check if the element has a 'controls' property first
+            GParamSpec *pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), "controls");
+            if (pspec) {
+                // Use the correct libcamera control names for autofocus
+                GstStructure *controls = gst_structure_new("controls",
+                    "AfMode", G_TYPE_INT, 2,           // AfModeContinuous
+                    "AfSpeed", G_TYPE_INT, 1,          // Fast autofocus speed
+                    "AfRange", G_TYPE_INT, 0,          // AfRangeNormal (full range)
+                    "LensPosition", G_TYPE_FLOAT, 0.0, // Let AF control lens position
+                    NULL);
+                g_object_set(src, "controls", controls, NULL);
+                gst_structure_free(controls);
+            } else {
+                g_print("Warning: libcamerasrc doesn't support 'controls' property - autofocus may not work\n");
+            }
         } else {
             g_print("Autofocus disabled - using manual focus at position %.2f\n", data->config.lens_position);
-            // Set manual focus mode with configurable lens position
-            GstStructure *controls = gst_structure_new("controls",
-                "AfMode", G_TYPE_INT, 0,                           // AfModeManual
-                "LensPosition", G_TYPE_FLOAT, data->config.lens_position, // User-configurable focus
-                NULL);
-            g_object_set(src, "controls", controls, NULL);
-            gst_structure_free(controls);
+            // Check if the element has a 'controls' property first
+            GParamSpec *pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), "controls");
+            if (pspec) {
+                // Set manual focus mode with configurable lens position
+                GstStructure *controls = gst_structure_new("controls",
+                    "AfMode", G_TYPE_INT, 0,                           // AfModeManual
+                    "LensPosition", G_TYPE_FLOAT, data->config.lens_position, // User-configurable focus
+                    NULL);
+                g_object_set(src, "controls", controls, NULL);
+                gst_structure_free(controls);
+            } else {
+                g_print("Warning: libcamerasrc doesn't support 'controls' property - manual focus may not work\n");
+            }
         }
     }
 
@@ -495,6 +522,12 @@ static gboolean build_and_run_pipeline(CustomData *data) {
                                   "colorimetry", G_TYPE_STRING, "bt709",
                                   "interlace-mode", G_TYPE_STRING, "progressive", NULL);
     }
+    
+    // Debug: Print the caps we're setting
+    gchar *caps_str = gst_caps_to_string(caps);
+    g_print("Setting caps: %s\n", caps_str);
+    g_free(caps_str);
+    
     g_object_set(capsfilter, "caps", caps, NULL);
     gst_caps_unref(caps);
 
@@ -580,8 +613,41 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL);
 
     if (!gst_element_link_many(src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL)) {
-        g_printerr("Failed to link elements.\n");
-        goto error;
+        g_printerr("Failed to link elements. This might be due to unsupported resolution/framerate combination.\n");
+        
+        // If linking fails with current resolution, try with a known working resolution
+        if (data->config.width != 1280 || data->config.height != 720) {
+            g_print("Retrying with fallback resolution 1280x720...\n");
+            
+            // Update caps with fallback resolution
+            GstCaps *fallback_caps = gst_caps_new_simple("video/x-raw",
+                                       "width", G_TYPE_INT, 1280,
+                                       "height", G_TYPE_INT, 720,
+                                       "framerate", GST_TYPE_FRACTION, data->config.framerate, 1,
+                                       NULL);
+            if (strcmp(data->config.src_type, "libcamerasrc") == 0) {
+                gst_caps_set_simple(fallback_caps, "format", G_TYPE_STRING, "YUY2",
+                                          "colorimetry", G_TYPE_STRING, "bt709",
+                                          "interlace-mode", G_TYPE_STRING, "progressive", NULL);
+            }
+            
+            gchar *fallback_caps_str = gst_caps_to_string(fallback_caps);
+            g_print("Fallback caps: %s\n", fallback_caps_str);
+            g_free(fallback_caps_str);
+            
+            g_object_set(capsfilter, "caps", fallback_caps, NULL);
+            gst_caps_unref(fallback_caps);
+            
+            // Try linking again with fallback resolution
+            if (!gst_element_link_many(src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL)) {
+                g_printerr("Failed to link elements even with fallback resolution.\n");
+                goto error;
+            } else {
+                g_print("Successfully linked with fallback resolution.\n");
+            }
+        } else {
+            goto error;
+        }
     }
 
     g_print("Pipeline built successfully. Starting...\n");
