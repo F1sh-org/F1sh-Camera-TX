@@ -403,7 +403,9 @@ static void request_completed(void *cls __attribute__((unused)), struct MHD_Conn
 
 static gboolean build_and_run_pipeline(CustomData *data) {
     g_mutex_lock(&data->state_mutex);
-    g_print("Building pipeline...\n");
+    g_print("Building pipeline with config: host=%s, port=%d, src=%s, %dx%d@%dfps\n",
+            data->config.host, data->config.port, data->config.src_type,
+            data->config.width, data->config.height, data->config.framerate);
 
     // Stop and cleanup existing pipeline
     if (data->pipeline) {
@@ -478,6 +480,10 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     }
 
     capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
+    if (!capsfilter) {
+        g_printerr("Failed to create capsfilter element.\n");
+        goto error;
+    }
     caps = gst_caps_new_simple("video/x-raw",
                                "width", G_TYPE_INT, data->config.width,
                                "height", G_TYPE_INT, data->config.height,
@@ -531,9 +537,17 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     }
 
     parser = gst_element_factory_make("h264parse", "parser");
+    if (!parser) {
+        g_printerr("Failed to create h264parse element.\n");
+        goto error;
+    }
     
     // Add caps filter after encoder to match the working pipeline
     encoder_caps = gst_element_factory_make("capsfilter", "encoder_caps");
+    if (!encoder_caps) {
+        g_printerr("Failed to create encoder caps filter.\n");
+        goto error;
+    }
     GstCaps *h264_caps = gst_caps_new_simple("video/x-h264",
                                              "level", G_TYPE_STRING, "4",
                                              NULL);
@@ -541,9 +555,19 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     gst_caps_unref(h264_caps);
 
     payloader = gst_element_factory_make("rtph264pay", "payloader");
+    if (!payloader) {
+        g_printerr("Failed to create rtph264pay element.\n");
+        goto error;
+    }
     g_object_set(payloader, "config-interval", -1, NULL);
 
     sink = gst_element_factory_make("udpsink", "sink");
+    if (!sink) {
+        g_printerr("Failed to create udpsink element.\n");
+        goto error;
+    }
+    
+    g_print("Configuring UDP sink: %s:%d\n", data->config.host, data->config.port);
     g_object_set(sink, "host", data->config.host, "port", data->config.port, "sync", FALSE, "async", FALSE, NULL);
 
     // Add probe to monitor data flow for statistics
@@ -570,11 +594,18 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     data->stats.start_time = gst_clock_get_time(gst_system_clock_obtain());
     g_mutex_unlock(&data->stats.stats_mutex);
     
-    gst_element_set_state(data->pipeline, GST_STATE_PLAYING);
+    GstStateChangeReturn ret = gst_element_set_state(data->pipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        g_printerr("Failed to set pipeline to PLAYING state.\n");
+        goto error;
+    }
+    
+    g_print("Pipeline state change result: %d (PLAYING=%d)\n", ret, GST_STATE_CHANGE_SUCCESS);
     
     // Get the bus after the pipeline is created and started
     data->bus = gst_element_get_bus(data->pipeline);
     
+    g_print("Pipeline started successfully, streaming to %s:%d\n", data->config.host, data->config.port);
     g_mutex_unlock(&data->state_mutex);
     return TRUE;
 
@@ -644,7 +675,18 @@ int main(int argc, char *argv[]) {
         if (data.pipeline_is_restarting) {
             data.pipeline_is_restarting = FALSE;
             g_mutex_unlock(&data.state_mutex);
-            build_and_run_pipeline(&data);
+            
+            g_print("Rebuilding pipeline with new configuration...\n");
+            if (!build_and_run_pipeline(&data)) {
+                g_printerr("Failed to rebuild pipeline. Attempting to restore default configuration...\n");
+                // Try to rebuild with default settings
+                if (!build_and_run_pipeline(&data)) {
+                    g_printerr("Critical error: Cannot rebuild pipeline. Exiting.\n");
+                    data.should_terminate = TRUE;
+                }
+            } else {
+                g_print("Pipeline successfully rebuilt and started.\n");
+            }
             continue;
         }
         
