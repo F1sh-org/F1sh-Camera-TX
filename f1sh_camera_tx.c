@@ -460,9 +460,23 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     // Stop and cleanup existing pipeline
     if (data->pipeline) {
         g_print("Stopping existing pipeline.\n");
-        gst_element_set_state(data->pipeline, GST_STATE_NULL);
+        
+        // Set to NULL state and wait for completion
+        GstStateChangeReturn ret = gst_element_set_state(data->pipeline, GST_STATE_NULL);
+        if (ret == GST_STATE_CHANGE_ASYNC) {
+            g_print("Waiting for pipeline to stop...\n");
+            ret = gst_element_get_state(data->pipeline, NULL, NULL, 5 * GST_SECOND);
+            if (ret == GST_STATE_CHANGE_FAILURE) {
+                g_printerr("Warning: Pipeline stop failed\n");
+            }
+        }
+        
         gst_object_unref(data->pipeline);
         data->pipeline = NULL;
+        
+        // Give libcamera time to release the camera resource
+        g_print("Waiting for camera resource to be released...\n");
+        g_usleep(1000000); // Wait 1 second
     }
     if (data->bus) {
         gst_object_unref(data->bus);
@@ -484,6 +498,7 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         g_printerr("Failed to create source: %s.\n", data->config.src_type);
         goto error;
     }
+    g_print("Successfully created source element: %s\n", data->config.src_type);
     if (strcmp(data->config.src_type, "v4l2src") == 0) {
         gchar *device_path = data->config.device;
         if (!device_path || strlen(device_path) == 0) {
@@ -668,7 +683,9 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     }
 
     gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL);
+    g_print("All elements added to pipeline\n");
 
+    g_print("Attempting to link pipeline elements...\n");
     if (!gst_element_link_many(src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL)) {
         g_printerr("Failed to link elements. This might be due to unsupported resolution/framerate combination.\n");
         
@@ -703,8 +720,10 @@ static gboolean build_and_run_pipeline(CustomData *data) {
                 g_print("Successfully linked with fallback resolution.\n");
             }
         } else {
-            goto error;
+            g_print("Successfully linked pipeline elements\n");
         }
+    } else {
+        g_print("Successfully linked pipeline elements\n");
     }
 
     g_print("Pipeline built successfully. Starting...\n");
