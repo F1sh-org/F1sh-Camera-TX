@@ -16,7 +16,7 @@ dependencies = [
 
 exe = executable(
   'F1sh-Camera-TX',
-  'f1sh_camera_tx.c',
+  'f1sh_camera_tx_new.c',
   dependencies : dependencies,
   install : true,
 )
