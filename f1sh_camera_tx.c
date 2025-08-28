@@ -499,7 +499,7 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         return FALSE;
     }
 
-    GstElement *src, *capsfilter, *convert, *encoder, *parser, *payloader, *sink;
+    GstElement *src, *capsfilter, *convert, *encoder, *encoder_caps, *parser, *payloader, *sink;
     GstCaps *caps;
 
     src = gst_element_factory_make("libcamerasrc", "source");
@@ -527,6 +527,9 @@ static gboolean build_and_run_pipeline(CustomData *data) {
                                "width", G_TYPE_INT, data->config.width,
                                "height", G_TYPE_INT, data->config.height,
                                "framerate", GST_TYPE_FRACTION, data->config.framerate, 1,
+                               "format", G_TYPE_STRING, "YUY2",
+                               "colorimetry", G_TYPE_STRING, "bt709",
+                               "interlace-mode", G_TYPE_STRING, "progressive",
                                NULL);
     
     gchar *caps_str = gst_caps_to_string(caps);
@@ -589,10 +592,13 @@ static gboolean build_and_run_pipeline(CustomData *data) {
                      "key-int-max", 30,   // GOP size
                      NULL);
     } else if (strcmp(actual_encoder_name, "v4l2h264enc") == 0) {
-        g_print("Configuring v4l2h264enc encoder with minimal settings\n");
-        // Use absolutely minimal settings - don't set any extra controls that might fail
-        // Let the encoder use its defaults
-        (void)encoder; // Just acknowledge we have the encoder, don't configure it
+        g_print("Configuring v4l2h264enc encoder (matching old working version)\n");
+        // Use the exact same settings as the old working version
+        GstStructure *ctrls = gst_structure_new("controls", 
+                                               "repeat_sequence_header", G_TYPE_BOOLEAN, TRUE,
+                                               NULL);
+        g_object_set(encoder, "extra-controls", ctrls, NULL);
+        gst_structure_free(ctrls);
     } else if (strcmp(actual_encoder_name, "omxh264enc") == 0) {
         g_print("Configuring omxh264enc encoder\n");
         g_object_set(encoder,
@@ -621,6 +627,18 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         g_printerr("Failed to create h264parse element.\n");
         goto error;
     }
+    
+    // Add caps filter after encoder to match the old working pipeline
+    encoder_caps = gst_element_factory_make("capsfilter", "encoder_caps");
+    if (!encoder_caps) {
+        g_printerr("Failed to create encoder caps filter.\n");
+        goto error;
+    }
+    GstCaps *h264_caps = gst_caps_new_simple("video/x-h264",
+                                             "level", G_TYPE_STRING, "4",
+                                             NULL);
+    g_object_set(encoder_caps, "caps", h264_caps, NULL);
+    gst_caps_unref(h264_caps);
 
     payloader = gst_element_factory_make("rtph264pay", "payloader");
     if (!payloader) {
@@ -645,11 +663,11 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         gst_object_unref(sink_pad);
     }
 
-    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, convert, encoder, parser, payloader, sink, NULL);
+    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, convert, encoder, encoder_caps, parser, payloader, sink, NULL);
     g_print("All elements added to pipeline\n");
 
     g_print("Attempting to link pipeline elements...\n");
-    if (!gst_element_link_many(src, capsfilter, convert, encoder, parser, payloader, sink, NULL)) {
+    if (!gst_element_link_many(src, capsfilter, convert, encoder, encoder_caps, parser, payloader, sink, NULL)) {
         g_printerr("Failed to link elements.\n");
         goto error;
     } else {
