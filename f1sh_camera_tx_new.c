@@ -499,7 +499,7 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         return FALSE;
     }
 
-    GstElement *src, *capsfilter, *encoder, *parser, *payloader, *sink;
+    GstElement *src, *capsfilter, *convert, *encoder, *parser, *payloader, *sink;
     GstCaps *caps;
 
     src = gst_element_factory_make("libcamerasrc", "source");
@@ -527,9 +527,6 @@ static gboolean build_and_run_pipeline(CustomData *data) {
                                "width", G_TYPE_INT, data->config.width,
                                "height", G_TYPE_INT, data->config.height,
                                "framerate", GST_TYPE_FRACTION, data->config.framerate, 1,
-                               "format", G_TYPE_STRING, "YUY2",
-                               "colorimetry", G_TYPE_STRING, "bt709",
-                               "interlace-mode", G_TYPE_STRING, "progressive",
                                NULL);
     
     gchar *caps_str = gst_caps_to_string(caps);
@@ -539,43 +536,87 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     g_object_set(capsfilter, "caps", caps, NULL);
     gst_caps_unref(caps);
 
-    encoder = gst_element_factory_make(data->config.encoder_type, "encoder");
-    if (!encoder) {
-        g_printerr("Failed to create encoder: %s. Trying fallback encoders...\n", data->config.encoder_type);
-        // Try fallback encoders
-        if (strcmp(data->config.encoder_type, "v4l2h264enc") == 0) {
-            encoder = gst_element_factory_make("x264enc", "encoder");
-            if (encoder) {
-                g_print("Using x264enc as fallback encoder.\n");
-                g_object_set(encoder, "tune", 0x00000004, "speed-preset", 1, "bitrate", 2048, "threads", 1, NULL);
-            }
-        } else if (strcmp(data->config.encoder_type, "x264enc") == 0) {
-            encoder = gst_element_factory_make("v4l2h264enc", "encoder");
-            if (encoder) {
-                g_print("Using v4l2h264enc as fallback encoder.\n");
-            }
+    convert = gst_element_factory_make("videoconvert", "convert");
+    if (!convert) {
+        g_printerr("Failed to create videoconvert element.\n");
+        goto error;
+    }
+
+    // Try encoders in order of preference with better error handling
+    const gchar *encoder_fallbacks[] = {
+        data->config.encoder_type,  // First try the requested encoder
+        "x264enc",                  // Software fallback
+        "v4l2h264enc",             // Hardware encoder
+        "nvh264enc",               // NVIDIA if available
+        "vaapih264enc",            // Intel VAAPI if available
+        NULL
+    };
+    
+    encoder = NULL;
+    gchar *actual_encoder_name = NULL;
+    
+    for (int i = 0; encoder_fallbacks[i] && !encoder; i++) {
+        // Skip if we already tried this encoder
+        if (i > 0 && strcmp(encoder_fallbacks[i], data->config.encoder_type) == 0) {
+            continue;
         }
         
-        if (!encoder) {
-            g_printerr("No suitable encoder found.\n");
-            goto error;
+        g_print("Trying encoder: %s\n", encoder_fallbacks[i]);
+        encoder = gst_element_factory_make(encoder_fallbacks[i], "encoder");
+        if (encoder) {
+            actual_encoder_name = g_strdup(encoder_fallbacks[i]);
+            g_print("Successfully created encoder: %s\n", actual_encoder_name);
+            break;
+        } else {
+            g_print("Encoder %s not available\n", encoder_fallbacks[i]);
         }
     }
     
-    // Configure encoder settings
-    if (strcmp(data->config.encoder_type, "x264enc") == 0 || 
-        (gst_element_get_factory(encoder) && 
-         strcmp(GST_OBJECT_NAME(gst_element_get_factory(encoder)), "x264enc") == 0)) {
-        g_object_set(encoder, "tune", 0x00000004, "speed-preset", 1, "bitrate", 2048, "threads", 1, NULL);
-    } else if (strcmp(data->config.encoder_type, "v4l2h264enc") == 0 ||
-               (gst_element_get_factory(encoder) && 
-                strcmp(GST_OBJECT_NAME(gst_element_get_factory(encoder)), "v4l2h264enc") == 0)) {
+    if (!encoder) {
+        g_printerr("No suitable encoder found after trying all fallbacks.\n");
+        goto error;
+    }
+    
+    // Configure encoder settings based on the actual encoder being used
+    if (strcmp(actual_encoder_name, "x264enc") == 0) {
+        g_print("Configuring x264enc encoder\n");
+        g_object_set(encoder, 
+                     "tune", 0x00000004,  // zerolatency
+                     "speed-preset", 1,   // superfast
+                     "bitrate", 2048,     // 2Mbps
+                     "threads", 1,        // Single thread for low latency
+                     "key-int-max", 30,   // GOP size
+                     NULL);
+    } else if (strcmp(actual_encoder_name, "v4l2h264enc") == 0) {
+        g_print("Configuring v4l2h264enc encoder\n");
+        // Use more conservative settings for v4l2h264enc
+        g_object_set(encoder,
+                     "output-io-mode", 2,  // GST_V4L2_IO_DMABUF
+                     NULL);
+        
+        // Try to set extra controls but don't fail if it doesn't work
         GstStructure *ctrls = gst_structure_new("controls", 
                                                "repeat_sequence_header", G_TYPE_BOOLEAN, TRUE,
+                                               "h264_i_frame_period", G_TYPE_INT, 30,
                                                NULL);
         g_object_set(encoder, "extra-controls", ctrls, NULL);
         gst_structure_free(ctrls);
+    } else if (strcmp(actual_encoder_name, "nvh264enc") == 0) {
+        g_print("Configuring nvh264enc encoder\n");
+        g_object_set(encoder,
+                     "bitrate", 2048,
+                     "gop-size", 30,
+                     "preset", 1,  // low-latency-hq
+                     NULL);
+    } else if (strcmp(actual_encoder_name, "vaapih264enc") == 0) {
+        g_print("Configuring vaapih264enc encoder\n");
+        g_object_set(encoder,
+                     "bitrate", 2048,
+                     "keyframe-period", 30,
+                     NULL);
     }
+    
+    g_free(actual_encoder_name);
 
     parser = gst_element_factory_make("h264parse", "parser");
     if (!parser) {
@@ -606,11 +647,11 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         gst_object_unref(sink_pad);
     }
 
-    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, encoder, parser, payloader, sink, NULL);
+    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, convert, encoder, parser, payloader, sink, NULL);
     g_print("All elements added to pipeline\n");
 
     g_print("Attempting to link pipeline elements...\n");
-    if (!gst_element_link_many(src, capsfilter, encoder, parser, payloader, sink, NULL)) {
+    if (!gst_element_link_many(src, capsfilter, convert, encoder, parser, payloader, sink, NULL)) {
         g_printerr("Failed to link elements.\n");
         goto error;
     } else {
@@ -737,9 +778,28 @@ int main(int argc, char *argv[]) {
                         gst_message_parse_error(msg, &err, &debug_info);
                         g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
                         g_printerr("Debugging info: %s\n", debug_info ? debug_info : "none");
+                        
+                        // Check if the error is from the encoder and try fallback
+                        if (strstr(GST_OBJECT_NAME(msg->src), "encoder")) {
+                            g_print("Encoder error detected. Attempting fallback to x264enc...\n");
+                            
+                            g_mutex_lock(&data.state_mutex);
+                            if (strcmp(data.config.encoder_type, "v4l2h264enc") == 0) {
+                                g_free(data.config.encoder_type);
+                                data.config.encoder_type = g_strdup("x264enc");
+                                data.pipeline_is_restarting = TRUE;
+                                g_print("Switching to x264enc software encoder\n");
+                            } else {
+                                g_print("Already using fallback encoder, terminating\n");
+                                data.should_terminate = TRUE;
+                            }
+                            g_mutex_unlock(&data.state_mutex);
+                        } else {
+                            data.should_terminate = TRUE;
+                        }
+                        
                         g_clear_error(&err);
                         g_free(debug_info);
-                        data.should_terminate = TRUE;
                         break;
                     case GST_MESSAGE_WARNING:
                         gst_message_parse_warning(msg, &err, &debug_info);

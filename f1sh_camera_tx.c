@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <microhttpd.h>
-#include <glob.h>
 #include <jansson.h>
 
 #ifdef __APPLE__
@@ -15,26 +14,19 @@
 // Default configuration
 #define DEFAULT_HOST "127.0.0.1"
 #define DEFAULT_PORT 5000
-#define DEFAULT_SRC "libcamerasrc"
-#define DEFAULT_DEVICE "" // Autodetect
-#define DEFAULT_ENCODER "v4l2h264enc"
 #define DEFAULT_WIDTH 1280
 #define DEFAULT_HEIGHT 720
-#define DEFAULT_FRAMERATE 60
-#define DEFAULT_AUTOFOCUS FALSE
+#define DEFAULT_FRAMERATE 30
 
-// Application data structure
-typedef struct _AppConfig {
+// Application configuration
+typedef struct {
     gchar *host;
     gint port;
-    gchar *src_type;
-    gchar *device;
+    gchar *camera_name;
     gchar *encoder_type;
     gint width;
     gint height;
     gint framerate;
-    gboolean autofocus;
-    gfloat lens_position; // 0.0 = close focus, 1.0+ = far/infinity focus
 } AppConfig;
 
 // Statistics structure
@@ -57,73 +49,18 @@ typedef struct _CustomData {
     gboolean should_terminate;
 } CustomData;
 
-// Structure to hold the connection-specific data for POST requests
 struct connection_info_struct {
     char *json_data;
     size_t data_size;
     CustomData *custom_data;
 };
 
-// Forward declarations
-static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *connection,
-                                            const char *url, const char *method,
-                                            const char *version, const char *upload_data,
-                                            size_t *upload_data_size, void **con_cls);
-static void request_completed(void *cls, struct MHD_Connection *connection,
-                              void **con_cls, enum MHD_RequestTerminationCode toe);
+// Function declarations
 static gboolean build_and_run_pipeline(CustomData *data);
+static void init_config(AppConfig *config);
 static void free_config_members(AppConfig *config);
-
-// Probe callback on source to timestamp buffers
-static GstPadProbeReturn
-source_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *info, gpointer user_data __attribute__((unused)))
-{
-    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-    
-    if (buffer) {
-        static guint64 source_frame_count = 0;
-        source_frame_count++;
-        
-        // Print debug info every 30 frames
-        if (source_frame_count % 30 == 0) {
-            gsize buffer_size = gst_buffer_get_size(buffer);
-            g_print("Source output: frame %llu, size %zu bytes\n", (unsigned long long)source_frame_count, buffer_size);
-        }
-        
-        // Add a custom timestamp as metadata to track when buffer was created
-        GstClockTime current_time = g_get_monotonic_time() * 1000; // Convert microseconds to nanoseconds
-        
-        // Create a new buffer with the timestamp metadata
-        buffer = gst_buffer_make_writable(buffer);
-        
-        // Store the capture time as a custom meta or just use the DTS field
-        GST_BUFFER_DTS(buffer) = current_time;
-        
-        GST_PAD_PROBE_INFO_DATA(info) = buffer;
-    }
-    
-    return GST_PAD_PROBE_OK;
-}
-
-// Probe callback to monitor encoder output
-static GstPadProbeReturn
-encoder_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *info, gpointer user_data __attribute__((unused)))
-{
-    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-    
-    if (buffer) {
-        static guint64 encoder_frame_count = 0;
-        encoder_frame_count++;
-        
-        // Print debug info every 30 frames
-        if (encoder_frame_count % 30 == 0) {
-            gsize buffer_size = gst_buffer_get_size(buffer);
-            g_print("Encoder output: frame %llu, size %zu bytes\n", (unsigned long long)encoder_frame_count, buffer_size);
-        }
-    }
-    
-    return GST_PAD_PROBE_OK;
-}
+static void init_stats(StreamStats *stats);
+static void free_stats(StreamStats *stats);
 
 // Probe callback to monitor data flow
 static GstPadProbeReturn
@@ -140,9 +77,9 @@ udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *in
         data->stats.total_bytes += buffer_size;
         data->stats.frame_count++;
         
-        // Print debug info every 30 frames (about every 0.5 seconds at 60fps)
-        if (data->stats.frame_count % 30 == 0) {
-            g_print("UDP probe: frame %llu, size %zu bytes, total %llu bytes\n", 
+        // Print debug info every 60 frames (about every 1 second at 60fps)
+        if (data->stats.frame_count % 60 == 0) {
+            g_print("Streaming: frame %llu, size %zu bytes, total %llu bytes\n", 
                     (unsigned long long)data->stats.frame_count, buffer_size, (unsigned long long)data->stats.total_bytes);
         }
         
@@ -156,20 +93,16 @@ udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *in
 void init_config(AppConfig *config) {
     config->host = g_strdup(DEFAULT_HOST);
     config->port = DEFAULT_PORT;
-    config->src_type = g_strdup(DEFAULT_SRC);
-    config->device = g_strdup(DEFAULT_DEVICE);
-    config->encoder_type = g_strdup(DEFAULT_ENCODER);
+    config->camera_name = g_strdup(""); // Auto-detect
+    config->encoder_type = g_strdup("v4l2h264enc");
     config->width = DEFAULT_WIDTH;
     config->height = DEFAULT_HEIGHT;
     config->framerate = DEFAULT_FRAMERATE;
-    config->autofocus = DEFAULT_AUTOFOCUS;
-    config->lens_position = 1.0; // Default to far focus
 }
 
 void free_config_members(AppConfig *config) {
     g_free(config->host);
-    g_free(config->src_type);
-    g_free(config->device);
+    g_free(config->camera_name);
     g_free(config->encoder_type);
 }
 
@@ -186,84 +119,113 @@ void free_stats(StreamStats *stats) {
     g_mutex_clear(&stats->stats_mutex);
 }
 
-// Find first available /dev/video* device
-gchar* find_video_device(void) {
-    glob_t glob_result;
-    memset(&glob_result, 0, sizeof(glob_result));
-
-    int return_value = glob("/dev/video*", GLOB_TILDE, NULL, &glob_result);
-    if (return_value != 0) {
-        globfree(&glob_result);
-        return NULL;
+// Get available libcamera cameras
+static json_t* get_available_cameras() {
+    json_t *cameras = json_array();
+    
+    // Create a temporary libcamerasrc element to query available cameras
+    GstElement *src = gst_element_factory_make("libcamerasrc", "temp_src");
+    if (src) {
+        // Get the camera-name property to see available cameras
+        GParamSpec *pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), "camera-name");
+        if (pspec && G_IS_PARAM_SPEC_STRING(pspec)) {
+            // Try to enumerate cameras by testing different camera names
+            // This is a simplified approach - in practice, libcamera provides better APIs
+            const gchar *common_cameras[] = {
+                "/base/soc/i2c0mux/i2c@1/imx708@1a",  // Pi Camera Module 3
+                "/base/soc/i2c0mux/i2c@1/imx219@10",  // Pi Camera Module v2
+                "/base/soc/i2c0mux/i2c@1/ov5647@36",  // Pi Camera Module v1
+                NULL
+            };
+            
+            for (int i = 0; common_cameras[i]; i++) {
+                json_array_append_new(cameras, json_string(common_cameras[i]));
+            }
+        }
+        gst_object_unref(src);
     }
-
-    gchar *device = NULL;
-    if (glob_result.gl_pathc > 0) {
-        device = g_strdup(glob_result.gl_pathv[0]);
+    
+    // If no specific cameras found, add a generic entry
+    if (json_array_size(cameras) == 0) {
+        json_array_append_new(cameras, json_string("auto-detect"));
     }
-
-    globfree(&glob_result);
-    return device;
+    
+    return cameras;
 }
 
-static enum MHD_Result send_json_response(struct MHD_Connection *connection, const char *json_string, int status_code) {
-    struct MHD_Response *response;
-    enum MHD_Result ret;
+// Get available encoders
+static json_t* get_available_encoders() {
+    json_t *encoders = json_array();
+    
+    const gchar *encoder_list[] = {
+        "v4l2h264enc",
+        "x264enc",
+        "nvh264enc",      // NVIDIA hardware encoder
+        "vaapih264enc",   // Intel VAAPI encoder
+        "omxh264enc",     // OpenMAX encoder
+        NULL
+    };
+    
+    for (int i = 0; encoder_list[i]; i++) {
+        GstElementFactory *factory = gst_element_factory_find(encoder_list[i]);
+        if (factory) {
+            json_array_append_new(encoders, json_string(encoder_list[i]));
+            gst_object_unref(factory);
+        }
+    }
+    
+    return encoders;
+}
 
-    response = MHD_create_response_from_buffer(strlen(json_string), (void *)json_string, MHD_RESPMEM_MUST_COPY);
+// Get supported resolutions for a camera
+static json_t* get_camera_resolutions(const gchar *camera_name) {
+    json_t *resolutions = json_array();
+    
+    // Common resolutions supported by most Pi cameras
+    const struct {
+        int width;
+        int height;
+        int max_framerate;
+    } common_resolutions[] = {
+        {640, 480, 90},
+        {1280, 720, 60},
+        {1920, 1080, 30},
+        {2304, 1296, 25},  // Pi Camera Module 3 native
+        {4608, 2592, 10},  // Pi Camera Module 3 full resolution
+        {0, 0, 0}  // End marker
+    };
+    
+    for (int i = 0; common_resolutions[i].width > 0; i++) {
+        json_t *res = json_object();
+        json_object_set_new(res, "width", json_integer(common_resolutions[i].width));
+        json_object_set_new(res, "height", json_integer(common_resolutions[i].height));
+        json_object_set_new(res, "max_framerate", json_integer(common_resolutions[i].max_framerate));
+        json_array_append_new(resolutions, res);
+    }
+    
+    return resolutions;
+}
+
+// Send JSON response
+static enum MHD_Result send_json_response(struct MHD_Connection *connection, const char *json_str, int status_code) {
+    struct MHD_Response *response = MHD_create_response_from_buffer(strlen(json_str), 
+                                                                   (void*)json_str, 
+                                                                   MHD_RESPMEM_MUST_COPY);
     MHD_add_response_header(response, "Content-Type", "application/json");
-    ret = MHD_queue_response(connection, status_code, response);
+    MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
+    
+    enum MHD_Result ret = MHD_queue_response(connection, status_code, response);
     MHD_destroy_response(response);
+    
     return ret;
 }
 
-static enum MHD_Result handle_health_check(struct MHD_Connection *connection) {
-    const char *page = "{\"status\":\"ok\"}";
-    return send_json_response(connection, page, MHD_HTTP_OK);
+// Handle health check
+static enum MHD_Result handle_health(struct MHD_Connection *connection) {
+    return send_json_response(connection, "{\"status\":\"healthy\",\"service\":\"F1sh-Camera-TX\"}", MHD_HTTP_OK);
 }
 
-static enum MHD_Result handle_get_config(struct MHD_Connection *connection, CustomData *data) {
-    g_mutex_lock(&data->state_mutex);
-    json_t *root = json_object();
-    json_object_set_new(root, "host", json_string(data->config.host));
-    json_object_set_new(root, "port", json_integer(data->config.port));
-    json_object_set_new(root, "src", json_string(data->config.src_type));
-    json_object_set_new(root, "device", json_string(data->config.device));
-    json_object_set_new(root, "encoder", json_string(data->config.encoder_type));
-    json_object_set_new(root, "width", json_integer(data->config.width));
-    json_object_set_new(root, "height", json_integer(data->config.height));
-    json_object_set_new(root, "framerate", json_integer(data->config.framerate));
-    json_object_set_new(root, "autofocus", json_boolean(data->config.autofocus));
-    json_object_set_new(root, "lens_position", json_real(data->config.lens_position));
-    g_mutex_unlock(&data->state_mutex);
-
-    char *json_str = json_dumps(root, 0);
-    json_decref(root);
-
-    enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
-    free(json_str);
-    return ret;
-}
-
-static enum MHD_Result handle_get_devices(struct MHD_Connection *connection) {
-    json_t *array = json_array();
-    gchar *device = find_video_device();
-    if (device) {
-        // In a real app, you'd loop through glob results
-        json_array_append_new(array, json_string(device));
-        g_free(device);
-    }
-
-    json_t *root = json_object();
-    json_object_set_new(root, "devices", array);
-    char *json_str = json_dumps(root, 0);
-    json_decref(root);
-
-    enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
-    free(json_str);
-    return ret;
-}
-
+// Handle statistics
 static enum MHD_Result handle_get_stats(struct MHD_Connection *connection, CustomData *data) {
     g_mutex_lock(&data->stats.stats_mutex);
     
@@ -292,6 +254,40 @@ static enum MHD_Result handle_get_stats(struct MHD_Connection *connection, Custo
     return ret;
 }
 
+// Handle GET requests
+static enum MHD_Result handle_get_request(struct MHD_Connection *connection, const char *url) {
+    if (strcmp(url, "/get") == 0) {
+        // Return available cameras and encoders
+        json_t *root = json_object();
+        json_object_set_new(root, "cameras", get_available_cameras());
+        json_object_set_new(root, "encoders", get_available_encoders());
+        
+        char *json_str = json_dumps(root, JSON_INDENT(2));
+        json_decref(root);
+        
+        enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
+        free(json_str);
+        return ret;
+    } else if (strncmp(url, "/get/", 5) == 0) {
+        // Return camera-specific information
+        const char *camera_name = url + 5;
+        
+        json_t *root = json_object();
+        json_object_set_new(root, "camera", json_string(camera_name));
+        json_object_set_new(root, "supported_resolutions", get_camera_resolutions(camera_name));
+        
+        char *json_str = json_dumps(root, JSON_INDENT(2));
+        json_decref(root);
+        
+        enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
+        free(json_str);
+        return ret;
+    }
+    
+    return send_json_response(connection, "{\"error\":\"Not Found\"}", MHD_HTTP_NOT_FOUND);
+}
+
+// Process configuration update
 static enum MHD_Result process_config_update(struct connection_info_struct *con_info) {
     json_error_t error;
     json_t *root = json_loadb(con_info->json_data, con_info->data_size, 0, &error);
@@ -308,14 +304,6 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     const char *str_val;
     gboolean needs_pipeline_rebuild = FALSE;
     gboolean needs_udp_update = FALSE;
-    
-    // Store old values to detect changes
-    gchar *old_host = g_strdup(data->config.host);
-    gint old_port = data->config.port;
-    gint old_width = data->config.width;
-    gint old_height = data->config.height;
-    gint old_framerate = data->config.framerate;
-    gboolean old_autofocus = data->config.autofocus;
 
     value = json_object_get(root, "host");
     if (json_is_string(value)) {
@@ -336,22 +324,14 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         }
     }
     
-    value = json_object_get(root, "src");
+    value = json_object_get(root, "camera");
     if (json_is_string(value)) {
         str_val = json_string_value(value);
-        if (strcmp(data->config.src_type, str_val) != 0) {
-            g_free(data->config.src_type);
-            data->config.src_type = g_strdup(str_val);
+        if (strcmp(data->config.camera_name, str_val) != 0) {
+            g_free(data->config.camera_name);
+            data->config.camera_name = g_strdup(str_val);
             needs_pipeline_rebuild = TRUE;
         }
-    }
-    
-    value = json_object_get(root, "device");
-    if (json_is_string(value)) {
-        str_val = json_string_value(value);
-        g_free(data->config.device);
-        data->config.device = g_strdup(str_val);
-        needs_pipeline_rebuild = TRUE;
     }
     
     value = json_object_get(root, "encoder");
@@ -367,10 +347,10 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     value = json_object_get(root, "width");
     if (json_is_integer(value)) {
         int new_width = json_integer_value(value);
-        if (new_width >= 320 && new_width <= 4096 && new_width != data->config.width) {
+        if (new_width >= 320 && new_width <= 4608 && new_width != data->config.width) {
             data->config.width = new_width;
             needs_pipeline_rebuild = TRUE;
-        } else if (new_width < 320 || new_width > 4096) {
+        } else if (new_width < 320 || new_width > 4608) {
             g_print("Warning: Invalid width %d, keeping current value %d\n", new_width, data->config.width);
         }
     }
@@ -378,10 +358,10 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     value = json_object_get(root, "height");
     if (json_is_integer(value)) {
         int new_height = json_integer_value(value);
-        if (new_height >= 240 && new_height <= 2160 && new_height != data->config.height) {
+        if (new_height >= 240 && new_height <= 2592 && new_height != data->config.height) {
             data->config.height = new_height;
             needs_pipeline_rebuild = TRUE;
-        } else if (new_height < 240 || new_height > 2160) {
+        } else if (new_height < 240 || new_height > 2592) {
             g_print("Warning: Invalid height %d, keeping current value %d\n", new_height, data->config.height);
         }
     }
@@ -397,33 +377,11 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         }
     }
 
-    value = json_object_get(root, "autofocus");
-    if (json_is_boolean(value)) {
-        gboolean new_autofocus = json_boolean_value(value);
-        if (new_autofocus != data->config.autofocus) {
-            data->config.autofocus = new_autofocus;
-            needs_pipeline_rebuild = TRUE;
-        }
-    }
-
-    value = json_object_get(root, "lens_position");
-    if (json_is_real(value)) {
-        data->config.lens_position = json_real_value(value);
-    } else if (json_is_integer(value)) {
-        data->config.lens_position = (gfloat)json_integer_value(value);
-    }
-
     // Decide what kind of update to perform
     if (needs_pipeline_rebuild) {
-        // Check for potentially problematic high resolution + high framerate combinations
-        if (data->config.width >= 1920 && data->config.height >= 1080 && data->config.framerate >= 60) {
-            g_print("WARNING: 1920x1080@60fps may not work reliably with libcamerasrc. Consider using 1280x720@60fps or 1920x1080@30fps.\n");
-        }
-        
-        g_print("Configuration change requires pipeline rebuild: host=%s, port=%d, src=%s, encoder=%s, %dx%d@%dfps, autofocus=%s, lens_position=%.2f\n", 
-                data->config.host, data->config.port, data->config.src_type, data->config.encoder_type,
-                data->config.width, data->config.height, data->config.framerate,
-                data->config.autofocus ? "enabled" : "disabled", data->config.lens_position);
+        g_print("Configuration change requires pipeline rebuild: host=%s, port=%d, camera=%s, encoder=%s, %dx%d@%dfps\n", 
+                data->config.host, data->config.port, data->config.camera_name, data->config.encoder_type,
+                data->config.width, data->config.height, data->config.framerate);
         data->pipeline_is_restarting = TRUE;
     } else if (needs_udp_update && data->pipeline) {
         g_print("Updating UDP sink destination: %s:%d (no pipeline rebuild needed)\n", 
@@ -443,7 +401,6 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
                 data->config.host, data->config.port);
     }
 
-    g_free(old_host);
     g_mutex_unlock(&data->state_mutex);
     json_decref(root);
 
@@ -466,18 +423,14 @@ static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *co
             *con_cls = (void *)con_info;
             return MHD_YES;
         }
-        *con_cls = (void *)1; // Generic marker for non-POST requests
-        return MHD_YES;
+        *con_cls = (void *)1; // Mark as handled for GET requests
     }
 
     if (0 == strcmp(method, "GET")) {
-        if (0 == strcmp(url, "/health")) return handle_health_check(connection);
-        if (0 == strcmp(url, "/config")) return handle_get_config(connection, data);
-        if (0 == strcmp(url, "/devices")) return handle_get_devices(connection);
+        if (0 == strcmp(url, "/health")) return handle_health(connection);
         if (0 == strcmp(url, "/stats")) return handle_get_stats(connection, data);
-    }
-
-    if (0 == strcmp(method, "POST") && 0 == strcmp(url, "/config")) {
+        if (0 == strncmp(url, "/get", 4)) return handle_get_request(connection, url);
+    } else if (0 == strcmp(method, "POST") && 0 == strcmp(url, "/config")) {
         struct connection_info_struct *con_info = *con_cls;
         if (*upload_data_size != 0) {
             con_info->json_data = realloc(con_info->json_data, con_info->data_size + *upload_data_size);
@@ -509,8 +462,8 @@ static void request_completed(void *cls __attribute__((unused)), struct MHD_Conn
 
 static gboolean build_and_run_pipeline(CustomData *data) {
     g_mutex_lock(&data->state_mutex);
-    g_print("Building pipeline with config: host=%s, port=%d, src=%s, %dx%d@%dfps\n",
-            data->config.host, data->config.port, data->config.src_type,
+    g_print("Building pipeline with config: host=%s, port=%d, camera=%s, encoder=%s, %dx%d@%dfps\n",
+            data->config.host, data->config.port, data->config.camera_name, data->config.encoder_type,
             data->config.width, data->config.height, data->config.framerate);
 
     // Stop and cleanup existing pipeline
@@ -546,77 +499,22 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         return FALSE;
     }
 
-    GstElement *src, *capsfilter, *encoder, *encoder_caps, *parser, *payloader, *sink;
+    GstElement *src, *capsfilter, *convert, *encoder, *parser, *payloader, *sink;
     GstCaps *caps;
 
-    src = gst_element_factory_make(data->config.src_type, "source");
+    src = gst_element_factory_make("libcamerasrc", "source");
     if (!src) {
-        g_printerr("Failed to create source: %s.\n", data->config.src_type);
+        g_printerr("Failed to create libcamerasrc.\n");
         goto error;
     }
-    g_print("Successfully created source element: %s\n", data->config.src_type);
-    if (strcmp(data->config.src_type, "v4l2src") == 0) {
-        gchar *device_path = data->config.device;
-        if (!device_path || strlen(device_path) == 0) {
-            device_path = find_video_device();
-        }
-        if (device_path) {
-            g_object_set(src, "device", device_path, NULL);
-            if (strlen(data->config.device) == 0) g_free(device_path);
-        }
-    } else if (strcmp(data->config.src_type, "libcamerasrc") == 0) {
-        // Don't force specific camera name - let libcamera auto-detect
-        // g_object_set(src, "camera-name", "/base/soc/i2c0mux/i2c@1/imx708@1a", NULL);
-        
-        // Configure autofocus for Camera Module 3
-        if (data->config.autofocus) {
-            g_print("Enabling autofocus for Camera Module 3\n");
-            
-            // Check if the element has a 'controls' property first
-            GParamSpec *pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), "controls");
-            if (pspec) {
-                // Use the correct libcamera control names for autofocus
-                GstStructure *controls = gst_structure_new("controls",
-                    "AfMode", G_TYPE_INT, 2,           // AfModeContinuous
-                    "AfSpeed", G_TYPE_INT, 1,          // Fast autofocus speed
-                    "AfRange", G_TYPE_INT, 0,          // AfRangeNormal (full range)
-                    "LensPosition", G_TYPE_FLOAT, 0.0, // Let AF control lens position
-                    NULL);
-                g_object_set(src, "controls", controls, NULL);
-                gst_structure_free(controls);
-            } else {
-                g_print("Warning: libcamerasrc doesn't support 'controls' property - autofocus may not work\n");
-            }
-        } else {
-            g_print("Autofocus disabled - using manual focus at position %.2f\n", data->config.lens_position);
-            // Check if the element has a 'controls' property first
-            GParamSpec *pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), "controls");
-            if (pspec) {
-                // Set manual focus mode with configurable lens position
-                GstStructure *controls = gst_structure_new("controls",
-                    "AfMode", G_TYPE_INT, 0,                           // AfModeManual
-                    "LensPosition", G_TYPE_FLOAT, data->config.lens_position, // User-configurable focus
-                    NULL);
-                g_object_set(src, "controls", controls, NULL);
-                gst_structure_free(controls);
-            } else {
-                g_print("Warning: libcamerasrc doesn't support 'controls' property - manual focus may not work\n");
-            }
-        }
-    }
-
-    // Try a simple test: if 1920x1080@60fps fails, try 1280x720@30fps
-    if (data->config.width == 1920 && data->config.height == 1080 && data->config.framerate == 60) {
-        g_print("High resolution/framerate detected. If pipeline fails, will try lower settings.\n");
-    }
+    g_print("Successfully created libcamerasrc element\n");
     
-    // Add probe to source to timestamp buffers for latency measurement
-    GstPad *src_pad = gst_element_get_static_pad(src, "src");
-    if (src_pad) {
-        gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_BUFFER, source_probe_callback, data, NULL);
-        gst_object_unref(src_pad);
+    // Set camera name if specified
+    if (strlen(data->config.camera_name) > 0 && strcmp(data->config.camera_name, "auto-detect") != 0) {
+        g_object_set(src, "camera-name", data->config.camera_name, NULL);
+        g_print("Using camera: %s\n", data->config.camera_name);
     } else {
-        g_printerr("Warning: Could not get source pad for probe\n");
+        g_print("Using auto-detected camera\n");
     }
 
     capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
@@ -624,19 +522,13 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         g_printerr("Failed to create capsfilter element.\n");
         goto error;
     }
+    
     caps = gst_caps_new_simple("video/x-raw",
                                "width", G_TYPE_INT, data->config.width,
                                "height", G_TYPE_INT, data->config.height,
                                "framerate", GST_TYPE_FRACTION, data->config.framerate, 1,
                                NULL);
-    if (strcmp(data->config.src_type, "libcamerasrc") == 0) {
-        // Use the exact format from the working gst-launch command
-        gst_caps_set_simple(caps, "format", G_TYPE_STRING, "YUY2",
-                                  "colorimetry", G_TYPE_STRING, "bt709",
-                                  "interlace-mode", G_TYPE_STRING, "progressive", NULL);
-    }
     
-    // Debug: Print the caps we're setting
     gchar *caps_str = gst_caps_to_string(caps);
     g_print("Setting caps: %s\n", caps_str);
     g_free(caps_str);
@@ -644,68 +536,93 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     g_object_set(capsfilter, "caps", caps, NULL);
     gst_caps_unref(caps);
 
-    encoder = gst_element_factory_make(data->config.encoder_type, "encoder");
-    if (!encoder) {
-        g_printerr("Failed to create encoder: %s. Trying fallback encoder...\n", data->config.encoder_type);
-        // Try fallback encoders
-        if (strcmp(data->config.encoder_type, "v4l2h264enc") == 0) {
-            encoder = gst_element_factory_make("x264enc", "encoder");
-            if (encoder) {
-                g_print("Using x264enc as fallback encoder.\n");
-                g_object_set(encoder, "tune", 0x00000004, "speed-preset", 1, "bitrate", 2048, "threads", 1, NULL);
-            }
-        } else if (strcmp(data->config.encoder_type, "x264enc") == 0) {
-            encoder = gst_element_factory_make("v4l2h264enc", "encoder");
-            if (encoder) {
-                g_print("Using v4l2h264enc as fallback encoder.\n");
-            }
+    convert = gst_element_factory_make("videoconvert", "convert");
+    if (!convert) {
+        g_printerr("Failed to create videoconvert element.\n");
+        goto error;
+    }
+
+    // Try encoders in order of preference with better error handling
+    const gchar *encoder_fallbacks[] = {
+        data->config.encoder_type,  // First try the requested encoder
+        "x264enc",                  // Software fallback
+        "v4l2h264enc",             // Hardware encoder
+        "nvh264enc",               // NVIDIA if available
+        "vaapih264enc",            // Intel VAAPI if available
+        NULL
+    };
+    
+    encoder = NULL;
+    gchar *actual_encoder_name = NULL;
+    
+    for (int i = 0; encoder_fallbacks[i] && !encoder; i++) {
+        // Skip if we already tried this encoder
+        if (i > 0 && strcmp(encoder_fallbacks[i], data->config.encoder_type) == 0) {
+            continue;
         }
         
-        if (!encoder) {
-            g_printerr("No suitable encoder found.\n");
-            goto error;
+        g_print("Trying encoder: %s\n", encoder_fallbacks[i]);
+        encoder = gst_element_factory_make(encoder_fallbacks[i], "encoder");
+        if (encoder) {
+            actual_encoder_name = g_strdup(encoder_fallbacks[i]);
+            g_print("Successfully created encoder: %s\n", actual_encoder_name);
+            break;
+        } else {
+            g_print("Encoder %s not available\n", encoder_fallbacks[i]);
         }
     }
     
-    if (strcmp(data->config.encoder_type, "x264enc") == 0 || 
-        (gst_element_get_factory(encoder) && 
-         strcmp(GST_OBJECT_NAME(gst_element_get_factory(encoder)), "x264enc") == 0)) {
-        g_object_set(encoder, "tune", 0x00000004, "speed-preset", 1, "bitrate", 2048, "threads", 1, NULL);
-    } else if (strcmp(data->config.encoder_type, "v4l2h264enc") == 0 ||
-               (gst_element_get_factory(encoder) && 
-                strcmp(GST_OBJECT_NAME(gst_element_get_factory(encoder)), "v4l2h264enc") == 0)) {
-        // Use the exact same settings as the working gst-launch command
+    if (!encoder) {
+        g_printerr("No suitable encoder found after trying all fallbacks.\n");
+        goto error;
+    }
+    
+    // Configure encoder settings based on the actual encoder being used
+    if (strcmp(actual_encoder_name, "x264enc") == 0) {
+        g_print("Configuring x264enc encoder\n");
+        g_object_set(encoder, 
+                     "tune", 0x00000004,  // zerolatency
+                     "speed-preset", 1,   // superfast
+                     "bitrate", 2048,     // 2Mbps
+                     "threads", 1,        // Single thread for low latency
+                     "key-int-max", 30,   // GOP size
+                     NULL);
+    } else if (strcmp(actual_encoder_name, "v4l2h264enc") == 0) {
+        g_print("Configuring v4l2h264enc encoder\n");
+        // Use more conservative settings for v4l2h264enc
+        g_object_set(encoder,
+                     "output-io-mode", 2,  // GST_V4L2_IO_DMABUF
+                     NULL);
+        
+        // Try to set extra controls but don't fail if it doesn't work
         GstStructure *ctrls = gst_structure_new("controls", 
                                                "repeat_sequence_header", G_TYPE_BOOLEAN, TRUE,
+                                               "h264_i_frame_period", G_TYPE_INT, 30,
                                                NULL);
         g_object_set(encoder, "extra-controls", ctrls, NULL);
         gst_structure_free(ctrls);
+    } else if (strcmp(actual_encoder_name, "nvh264enc") == 0) {
+        g_print("Configuring nvh264enc encoder\n");
+        g_object_set(encoder,
+                     "bitrate", 2048,
+                     "gop-size", 30,
+                     "preset", 1,  // low-latency-hq
+                     NULL);
+    } else if (strcmp(actual_encoder_name, "vaapih264enc") == 0) {
+        g_print("Configuring vaapih264enc encoder\n");
+        g_object_set(encoder,
+                     "bitrate", 2048,
+                     "keyframe-period", 30,
+                     NULL);
     }
-
-    // Add probe to monitor encoder output
-    GstPad *encoder_pad = gst_element_get_static_pad(encoder, "src");
-    if (encoder_pad) {
-        gst_pad_add_probe(encoder_pad, GST_PAD_PROBE_TYPE_BUFFER, encoder_probe_callback, data, NULL);
-        gst_object_unref(encoder_pad);
-    }
+    
+    g_free(actual_encoder_name);
 
     parser = gst_element_factory_make("h264parse", "parser");
     if (!parser) {
         g_printerr("Failed to create h264parse element.\n");
         goto error;
     }
-    
-    // Add caps filter after encoder to match the working pipeline
-    encoder_caps = gst_element_factory_make("capsfilter", "encoder_caps");
-    if (!encoder_caps) {
-        g_printerr("Failed to create encoder caps filter.\n");
-        goto error;
-    }
-    GstCaps *h264_caps = gst_caps_new_simple("video/x-h264",
-                                             "level", G_TYPE_STRING, "4",
-                                             NULL);
-    g_object_set(encoder_caps, "caps", h264_caps, NULL);
-    gst_caps_unref(h264_caps);
 
     payloader = gst_element_factory_make("rtph264pay", "payloader");
     if (!payloader) {
@@ -721,14 +638,6 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     }
     
     g_print("Configuring UDP sink: %s:%d\n", data->config.host, data->config.port);
-    
-    // Test UDP connectivity (simple socket test)
-    if (strcmp(data->config.host, "127.0.0.1") != 0 && strcmp(data->config.host, "localhost") != 0) {
-        g_print("Testing network connectivity to %s:%d...\n", data->config.host, data->config.port);
-        // Note: This is a basic check - actual UDP doesn't require connection
-        // but this helps verify the host is reachable
-    }
-    
     g_object_set(sink, "host", data->config.host, "port", data->config.port, "sync", FALSE, "async", FALSE, NULL);
 
     // Add probe to monitor data flow for statistics
@@ -738,46 +647,13 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         gst_object_unref(sink_pad);
     }
 
-    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL);
+    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, convert, encoder, parser, payloader, sink, NULL);
     g_print("All elements added to pipeline\n");
 
     g_print("Attempting to link pipeline elements...\n");
-    if (!gst_element_link_many(src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL)) {
-        g_printerr("Failed to link elements. This might be due to unsupported resolution/framerate combination.\n");
-        
-        // If linking fails with current resolution, try with a known working resolution
-        if (data->config.width != 1280 || data->config.height != 720) {
-            g_print("Retrying with fallback resolution 1280x720...\n");
-            
-            // Update caps with fallback resolution
-            GstCaps *fallback_caps = gst_caps_new_simple("video/x-raw",
-                                       "width", G_TYPE_INT, 1280,
-                                       "height", G_TYPE_INT, 720,
-                                       "framerate", GST_TYPE_FRACTION, data->config.framerate, 1,
-                                       NULL);
-            if (strcmp(data->config.src_type, "libcamerasrc") == 0) {
-                gst_caps_set_simple(fallback_caps, "format", G_TYPE_STRING, "YUY2",
-                                          "colorimetry", G_TYPE_STRING, "bt709",
-                                          "interlace-mode", G_TYPE_STRING, "progressive", NULL);
-            }
-            
-            gchar *fallback_caps_str = gst_caps_to_string(fallback_caps);
-            g_print("Fallback caps: %s\n", fallback_caps_str);
-            g_free(fallback_caps_str);
-            
-            g_object_set(capsfilter, "caps", fallback_caps, NULL);
-            gst_caps_unref(fallback_caps);
-            
-            // Try linking again with fallback resolution
-            if (!gst_element_link_many(src, capsfilter, encoder, encoder_caps, parser, payloader, sink, NULL)) {
-                g_printerr("Failed to link elements even with fallback resolution.\n");
-                goto error;
-            } else {
-                g_print("Successfully linked with fallback resolution.\n");
-            }
-        } else {
-            g_print("Successfully linked pipeline elements\n");
-        }
+    if (!gst_element_link_many(src, capsfilter, convert, encoder, parser, payloader, sink, NULL)) {
+        g_printerr("Failed to link elements.\n");
+        goto error;
     } else {
         g_print("Successfully linked pipeline elements\n");
     }
@@ -804,51 +680,6 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     data->bus = gst_element_get_bus(data->pipeline);
     
     g_print("Pipeline started successfully, streaming to %s:%d\n", data->config.host, data->config.port);
-    
-    // Wait a moment and check if the pipeline is actually working
-    g_usleep(500000); // Wait 500ms
-    
-    GstState current_state, pending_state;
-    GstStateChangeReturn state_ret = gst_element_get_state(data->pipeline, &current_state, &pending_state, GST_CLOCK_TIME_NONE);
-    g_print("Pipeline state check: return=%d, current=%s, pending=%s\n", 
-            state_ret, gst_element_state_get_name(current_state), gst_element_state_get_name(pending_state));
-    
-    if (current_state != GST_STATE_PLAYING) {
-        g_printerr("Warning: Pipeline is not in PLAYING state after startup!\n");
-    }
-    
-    // For high resolution configurations, wait a bit longer and check if data is flowing
-    if (data->config.width >= 1920 || data->config.height >= 1080) {
-        g_print("High resolution detected, checking data flow...\n");
-        g_usleep(2000000); // Wait 2 more seconds
-        
-        g_mutex_lock(&data->stats.stats_mutex);
-        guint64 initial_frame_count = data->stats.frame_count;
-        g_mutex_unlock(&data->stats.stats_mutex);
-        
-        g_usleep(1000000); // Wait 1 more second
-        
-        g_mutex_lock(&data->stats.stats_mutex);
-        guint64 current_frame_count = data->stats.frame_count;
-        g_mutex_unlock(&data->stats.stats_mutex);
-        
-        if (current_frame_count <= initial_frame_count) {
-            g_printerr("ERROR: High resolution pipeline is not producing data. Falling back to 1280x720@30fps...\n");
-            
-            // Update configuration to working values
-            data->config.width = 1280;
-            data->config.height = 720;
-            data->config.framerate = 30;
-            
-            g_mutex_unlock(&data->state_mutex);
-            
-            // Recursively call to rebuild with fallback settings
-            return build_and_run_pipeline(data);
-        } else {
-            g_print("High resolution pipeline is working correctly (%llu frames produced)\n", 
-                    (unsigned long long)(current_frame_count - initial_frame_count));
-        }
-    }
     
     g_mutex_unlock(&data->state_mutex);
     return TRUE;
@@ -880,15 +711,6 @@ int main(int argc, char *argv[]) {
     g_mutex_init(&data.state_mutex);
     data.should_terminate = FALSE;
 
-    if (strlen(data.config.device) == 0 && (strcmp(data.config.src_type, "v4l2src") == 0)) {
-        gchar *found_device = find_video_device();
-        if (found_device) {
-            g_free(data.config.device);
-            data.config.device = found_device;
-            g_print("Auto-detected video device: %s\n", data.config.device);
-        }
-    }
-
     if (!build_and_run_pipeline(&data)) {
         g_printerr("Failed to start initial pipeline. Exiting.\n");
         free_config_members(&data.config);
@@ -896,20 +718,26 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    data.daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_THREAD_PER_CONNECTION, HTTP_PORT, NULL, NULL,
+    data.daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD, HTTP_PORT, NULL, NULL,
                                    &answer_to_connection, &data,
-                                   MHD_OPTION_NOTIFY_COMPLETED, &request_completed, NULL,
+                                   MHD_OPTION_NOTIFY_COMPLETED, request_completed, NULL,
                                    MHD_OPTION_END);
     if (NULL == data.daemon) {
-        g_printerr("Failed to start HTTP daemon on port %d\n", HTTP_PORT);
-        return 1;
+        g_printerr("Failed to start HTTP server.\n");
+        return -1;
     }
+
     g_print("HTTP server started on port %d\n", HTTP_PORT);
+    g_print("Available endpoints:\n");
+    g_print("  GET  /health - Health check\n");
+    g_print("  GET  /stats - Stream statistics\n");
+    g_print("  GET  /get - List available cameras and encoders\n");
+    g_print("  GET  /get/[camera_name] - Get camera-specific information\n");
+    g_print("  POST /config - Update configuration\n");
 
     do {
         g_mutex_lock(&data.state_mutex);
         
-        // Check if we should terminate
         if (data.should_terminate) {
             g_mutex_unlock(&data.state_mutex);
             break;
@@ -922,12 +750,8 @@ int main(int argc, char *argv[]) {
             
             g_print("Rebuilding pipeline with new configuration...\n");
             if (!build_and_run_pipeline(&data)) {
-                g_printerr("Failed to rebuild pipeline. Attempting to restore default configuration...\n");
-                // Try to rebuild with default settings
-                if (!build_and_run_pipeline(&data)) {
-                    g_printerr("Critical error: Cannot rebuild pipeline. Exiting.\n");
-                    data.should_terminate = TRUE;
-                }
+                g_printerr("Failed to rebuild pipeline.\n");
+                data.should_terminate = TRUE;
             } else {
                 g_print("Pipeline successfully rebuilt and started.\n");
             }
@@ -954,9 +778,28 @@ int main(int argc, char *argv[]) {
                         gst_message_parse_error(msg, &err, &debug_info);
                         g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
                         g_printerr("Debugging info: %s\n", debug_info ? debug_info : "none");
+                        
+                        // Check if the error is from the encoder and try fallback
+                        if (strstr(GST_OBJECT_NAME(msg->src), "encoder")) {
+                            g_print("Encoder error detected. Attempting fallback to x264enc...\n");
+                            
+                            g_mutex_lock(&data.state_mutex);
+                            if (strcmp(data.config.encoder_type, "v4l2h264enc") == 0) {
+                                g_free(data.config.encoder_type);
+                                data.config.encoder_type = g_strdup("x264enc");
+                                data.pipeline_is_restarting = TRUE;
+                                g_print("Switching to x264enc software encoder\n");
+                            } else {
+                                g_print("Already using fallback encoder, terminating\n");
+                                data.should_terminate = TRUE;
+                            }
+                            g_mutex_unlock(&data.state_mutex);
+                        } else {
+                            data.should_terminate = TRUE;
+                        }
+                        
                         g_clear_error(&err);
                         g_free(debug_info);
-                        data.should_terminate = TRUE;
                         break;
                     case GST_MESSAGE_WARNING:
                         gst_message_parse_warning(msg, &err, &debug_info);
