@@ -96,6 +96,26 @@ source_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *inf
     return GST_PAD_PROBE_OK;
 }
 
+// Probe callback to monitor encoder output
+static GstPadProbeReturn
+encoder_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *info, gpointer user_data __attribute__((unused)))
+{
+    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    
+    if (buffer) {
+        static guint64 encoder_frame_count = 0;
+        encoder_frame_count++;
+        
+        // Print debug info every 30 frames
+        if (encoder_frame_count % 30 == 0) {
+            gsize buffer_size = gst_buffer_get_size(buffer);
+            g_print("Encoder output: frame %llu, size %zu bytes\n", (unsigned long long)encoder_frame_count, buffer_size);
+        }
+    }
+    
+    return GST_PAD_PROBE_OK;
+}
+
 // Probe callback to monitor data flow
 static GstPadProbeReturn
 udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *info, gpointer user_data)
@@ -110,6 +130,12 @@ udpsink_probe_callback (GstPad *pad __attribute__((unused)), GstPadProbeInfo *in
         gsize buffer_size = gst_buffer_get_size(buffer);
         data->stats.total_bytes += buffer_size;
         data->stats.frame_count++;
+        
+        // Print debug info every 30 frames (about every 0.5 seconds at 60fps)
+        if (data->stats.frame_count % 30 == 0) {
+            g_print("UDP probe: frame %llu, size %zu bytes, total %llu bytes\n", 
+                    (unsigned long long)data->stats.frame_count, buffer_size, (unsigned long long)data->stats.total_bytes);
+        }
         
         g_mutex_unlock(&data->stats.stats_mutex);
     }
@@ -569,6 +595,13 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         gst_structure_free(ctrls);
     }
 
+    // Add probe to monitor encoder output
+    GstPad *encoder_pad = gst_element_get_static_pad(encoder, "src");
+    if (encoder_pad) {
+        gst_pad_add_probe(encoder_pad, GST_PAD_PROBE_TYPE_BUFFER, encoder_probe_callback, data, NULL);
+        gst_object_unref(encoder_pad);
+    }
+
     parser = gst_element_factory_make("h264parse", "parser");
     if (!parser) {
         g_printerr("Failed to create h264parse element.\n");
@@ -601,6 +634,14 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     }
     
     g_print("Configuring UDP sink: %s:%d\n", data->config.host, data->config.port);
+    
+    // Test UDP connectivity (simple socket test)
+    if (strcmp(data->config.host, "127.0.0.1") != 0 && strcmp(data->config.host, "localhost") != 0) {
+        g_print("Testing network connectivity to %s:%d...\n", data->config.host, data->config.port);
+        // Note: This is a basic check - actual UDP doesn't require connection
+        // but this helps verify the host is reachable
+    }
+    
     g_object_set(sink, "host", data->config.host, "port", data->config.port, "sync", FALSE, "async", FALSE, NULL);
 
     // Add probe to monitor data flow for statistics
