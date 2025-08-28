@@ -306,24 +306,44 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
 
     json_t *value;
     const char *str_val;
+    gboolean needs_pipeline_rebuild = FALSE;
+    gboolean needs_udp_update = FALSE;
+    
+    // Store old values to detect changes
+    gchar *old_host = g_strdup(data->config.host);
+    gint old_port = data->config.port;
+    gint old_width = data->config.width;
+    gint old_height = data->config.height;
+    gint old_framerate = data->config.framerate;
+    gboolean old_autofocus = data->config.autofocus;
 
     value = json_object_get(root, "host");
     if (json_is_string(value)) {
         str_val = json_string_value(value);
-        g_free(data->config.host);
-        data->config.host = g_strdup(str_val);
+        if (strcmp(data->config.host, str_val) != 0) {
+            g_free(data->config.host);
+            data->config.host = g_strdup(str_val);
+            needs_udp_update = TRUE;
+        }
     }
     
     value = json_object_get(root, "port");
     if (json_is_integer(value)) {
-        data->config.port = json_integer_value(value);
+        gint new_port = json_integer_value(value);
+        if (data->config.port != new_port) {
+            data->config.port = new_port;
+            needs_udp_update = TRUE;
+        }
     }
     
     value = json_object_get(root, "src");
     if (json_is_string(value)) {
         str_val = json_string_value(value);
-        g_free(data->config.src_type);
-        data->config.src_type = g_strdup(str_val);
+        if (strcmp(data->config.src_type, str_val) != 0) {
+            g_free(data->config.src_type);
+            data->config.src_type = g_strdup(str_val);
+            needs_pipeline_rebuild = TRUE;
+        }
     }
     
     value = json_object_get(root, "device");
@@ -331,21 +351,26 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         str_val = json_string_value(value);
         g_free(data->config.device);
         data->config.device = g_strdup(str_val);
+        needs_pipeline_rebuild = TRUE;
     }
     
     value = json_object_get(root, "encoder");
     if (json_is_string(value)) {
         str_val = json_string_value(value);
-        g_free(data->config.encoder_type);
-        data->config.encoder_type = g_strdup(str_val);
+        if (strcmp(data->config.encoder_type, str_val) != 0) {
+            g_free(data->config.encoder_type);
+            data->config.encoder_type = g_strdup(str_val);
+            needs_pipeline_rebuild = TRUE;
+        }
     }
     
     value = json_object_get(root, "width");
     if (json_is_integer(value)) {
         int new_width = json_integer_value(value);
-        if (new_width >= 320 && new_width <= 4096) {
+        if (new_width >= 320 && new_width <= 4096 && new_width != data->config.width) {
             data->config.width = new_width;
-        } else {
+            needs_pipeline_rebuild = TRUE;
+        } else if (new_width < 320 || new_width > 4096) {
             g_print("Warning: Invalid width %d, keeping current value %d\n", new_width, data->config.width);
         }
     }
@@ -353,9 +378,10 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     value = json_object_get(root, "height");
     if (json_is_integer(value)) {
         int new_height = json_integer_value(value);
-        if (new_height >= 240 && new_height <= 2160) {
+        if (new_height >= 240 && new_height <= 2160 && new_height != data->config.height) {
             data->config.height = new_height;
-        } else {
+            needs_pipeline_rebuild = TRUE;
+        } else if (new_height < 240 || new_height > 2160) {
             g_print("Warning: Invalid height %d, keeping current value %d\n", new_height, data->config.height);
         }
     }
@@ -363,16 +389,21 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     value = json_object_get(root, "framerate");
     if (json_is_integer(value)) {
         int new_framerate = json_integer_value(value);
-        if (new_framerate >= 1 && new_framerate <= 120) {
+        if (new_framerate >= 1 && new_framerate <= 120 && new_framerate != data->config.framerate) {
             data->config.framerate = new_framerate;
-        } else {
+            needs_pipeline_rebuild = TRUE;
+        } else if (new_framerate < 1 || new_framerate > 120) {
             g_print("Warning: Invalid framerate %d, keeping current value %d\n", new_framerate, data->config.framerate);
         }
     }
 
     value = json_object_get(root, "autofocus");
     if (json_is_boolean(value)) {
-        data->config.autofocus = json_boolean_value(value);
+        gboolean new_autofocus = json_boolean_value(value);
+        if (new_autofocus != data->config.autofocus) {
+            data->config.autofocus = new_autofocus;
+            needs_pipeline_rebuild = TRUE;
+        }
     }
 
     value = json_object_get(root, "lens_position");
@@ -382,12 +413,32 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         data->config.lens_position = (gfloat)json_integer_value(value);
     }
 
-    g_print("Configuration updated: host=%s, port=%d, src=%s, encoder=%s, autofocus=%s, lens_position=%.2f\n", 
-            data->config.host, data->config.port, data->config.src_type, data->config.encoder_type,
-            data->config.autofocus ? "enabled" : "disabled", data->config.lens_position);
-    
-    data->pipeline_is_restarting = TRUE;
+    // Decide what kind of update to perform
+    if (needs_pipeline_rebuild) {
+        g_print("Configuration change requires pipeline rebuild: host=%s, port=%d, src=%s, encoder=%s, %dx%d@%dfps, autofocus=%s, lens_position=%.2f\n", 
+                data->config.host, data->config.port, data->config.src_type, data->config.encoder_type,
+                data->config.width, data->config.height, data->config.framerate,
+                data->config.autofocus ? "enabled" : "disabled", data->config.lens_position);
+        data->pipeline_is_restarting = TRUE;
+    } else if (needs_udp_update && data->pipeline) {
+        g_print("Updating UDP sink destination: %s:%d (no pipeline rebuild needed)\n", 
+                data->config.host, data->config.port);
+        
+        // Find the UDP sink element and update its properties
+        GstElement *sink = gst_bin_get_by_name(GST_BIN(data->pipeline), "sink");
+        if (sink) {
+            g_object_set(sink, "host", data->config.host, "port", data->config.port, NULL);
+            gst_object_unref(sink);
+            g_print("UDP sink updated successfully\n");
+        } else {
+            g_printerr("Could not find UDP sink element for update\n");
+        }
+    } else {
+        g_print("Configuration updated (no changes required): host=%s, port=%d\n", 
+                data->config.host, data->config.port);
+    }
 
+    g_free(old_host);
     g_mutex_unlock(&data->state_mutex);
     json_decref(root);
 
