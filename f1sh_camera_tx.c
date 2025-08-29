@@ -139,57 +139,53 @@ static json_t* get_available_cameras(void) {
             }
         }
         
-        // Also check for common camera paths by trying to enumerate /sys/class/video4linux
-        // This helps find additional cameras that might be available
-        glob_t glob_result;
-        if (glob("/sys/class/video4linux/video*", GLOB_NOSORT, NULL, &glob_result) == 0) {
-            for (size_t i = 0; i < glob_result.gl_pathc; i++) {
-                // Extract video device number and create potential libcamera names
-                gchar *path = glob_result.gl_pathv[i];
-                gchar *basename = g_path_get_basename(path);
-                
-                // For Raspberry Pi, common camera paths include:
-                if (strstr(basename, "video0") || strstr(basename, "video10") || strstr(basename, "video11")) {
-                    // These might correspond to libcamera devices
-                    json_array_append_new(cameras, json_string("auto-detect"));
-                    break; // Only add once
-                }
-                g_free(basename);
-            }
-            globfree(&glob_result);
-        }
-        
         gst_object_unref(src);
     }
     
-    // If no cameras found, add auto-detect as fallback
-    if (json_array_size(cameras) == 0) {
-        json_array_append_new(cameras, json_string("auto-detect"));
+    // Try to enumerate cameras by testing libcamerasrc in different states
+    // This is a more direct approach to find working cameras
+    for (int cam_index = 0; cam_index < 10; cam_index++) {
+        GstElement *test_src = gst_element_factory_make("libcamerasrc", "test_cam");
+        if (test_src) {
+            gchar *cam_name = g_strdup_printf("camera%d", cam_index);
+            g_object_set(test_src, "camera-name", cam_name, NULL);
+            
+            // Try to set to READY state to see if camera exists
+            GstStateChangeReturn ret = gst_element_set_state(test_src, GST_STATE_READY);
+            if (ret != GST_STATE_CHANGE_FAILURE) {
+                // Camera seems to exist, add it
+                gchar *actual_name = NULL;
+                g_object_get(test_src, "camera-name", &actual_name, NULL);
+                if (actual_name && strlen(actual_name) > 0) {
+                    // Check if not already in list
+                    gboolean found = FALSE;
+                    size_t array_size = json_array_size(cameras);
+                    for (size_t j = 0; j < array_size; j++) {
+                        json_t *item = json_array_get(cameras, j);
+                        const char *existing = json_string_value(item);
+                        if (existing && strcmp(existing, actual_name) == 0) {
+                            found = TRUE;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        json_array_append_new(cameras, json_string(actual_name));
+                        g_print("Found camera: %s\n", actual_name);
+                    }
+                    g_free(actual_name);
+                }
+                gst_element_set_state(test_src, GST_STATE_NULL);
+            }
+            
+            g_free(cam_name);
+            gst_object_unref(test_src);
+        }
     }
     
-    // Add common Pi camera device paths as potential options
-    const gchar *common_cameras[] = {
-        "/base/soc/i2c0mux/i2c@1/imx708@1a",  // Pi Camera Module 3
-        "/base/soc/i2c0mux/i2c@1/imx219@10",  // Pi Camera Module v2
-        "/base/soc/i2c0mux/i2c@1/ov5647@36",  // Pi Camera Module v1
-        NULL
-    };
-    
-    for (int i = 0; common_cameras[i]; i++) {
-        // Check if this camera path is not already in the list
-        gboolean found = FALSE;
-        size_t array_size = json_array_size(cameras);
-        for (size_t j = 0; j < array_size; j++) {
-            json_t *item = json_array_get(cameras, j);
-            const char *existing = json_string_value(item);
-            if (existing && strcmp(existing, common_cameras[i]) == 0) {
-                found = TRUE;
-                break;
-            }
-        }
-        if (!found) {
-            json_array_append_new(cameras, json_string(common_cameras[i]));
-        }
+    // If no specific cameras found, add auto-detect as fallback
+    if (json_array_size(cameras) == 0) {
+        json_array_append_new(cameras, json_string("auto-detect"));
+        g_print("No specific cameras detected, using auto-detect\n");
     }
     
     return cameras;
@@ -239,58 +235,130 @@ static json_t* get_available_encoders(void) {
 static json_t* get_camera_resolutions(const gchar *camera_name) {
     json_t *resolutions = json_array();
     
-    // Try to probe actual capabilities if possible
+    // Create a libcamerasrc element and try to query its actual capabilities
     GstElement *src = gst_element_factory_make("libcamerasrc", "probe_src");
-    if (src && camera_name && strcmp(camera_name, "auto-detect") != 0) {
-        g_object_set(src, "camera-name", camera_name, NULL);
-        
-        // Try to get caps from the source pad
-        GstPad *src_pad = gst_element_get_static_pad(src, "src");
-        if (src_pad) {
-            // This would ideally query the actual caps, but libcamerasrc 
-            // needs to be in a certain state. For now, we'll use common resolutions.
-            gst_object_unref(src_pad);
-        }
-        gst_object_unref(src);
+    if (!src) {
+        g_printerr("Failed to create libcamerasrc for resolution probing\n");
+        return resolutions;
     }
     
-    // Provide comprehensive resolution list based on common camera capabilities
-    const struct {
-        int width;
-        int height;
-        int max_framerate;
-        const char *description;
-    } common_resolutions[] = {
-        // Low resolution - high framerate
-        {320, 240, 120, "QVGA (very low res, high fps)"},
-        {640, 480, 90, "VGA (low res, high fps)"},
-        {800, 600, 60, "SVGA"},
-        
-        // Medium resolution
-        {1024, 768, 60, "XGA"},
-        {1280, 720, 60, "HD 720p"},
-        {1280, 960, 30, "SXGA"},
-        {1920, 1080, 30, "Full HD 1080p"},
-        
-        // High resolution (Pi Camera Module 3 specific)
-        {2304, 1296, 25, "Pi Cam v3 native (4:3)"},
-        {2592, 1944, 15, "Pi Cam v3 still mode"},
-        {4608, 2592, 10, "Pi Cam v3 full resolution"},
-        
-        // Ultra-wide and other formats
-        {1640, 1232, 30, "Pi Cam v3 wide"},
-        {1640, 922, 40, "Pi Cam v3 16:9 crop"},
-        
-        {0, 0, 0, NULL}  // End marker
-    };
+    // Set camera name if specified
+    if (camera_name && strcmp(camera_name, "auto-detect") != 0) {
+        g_object_set(src, "camera-name", camera_name, NULL);
+    }
     
-    for (int i = 0; common_resolutions[i].width > 0; i++) {
-        json_t *res = json_object();
-        json_object_set_new(res, "width", json_integer(common_resolutions[i].width));
-        json_object_set_new(res, "height", json_integer(common_resolutions[i].height));
-        json_object_set_new(res, "max_framerate", json_integer(common_resolutions[i].max_framerate));
-        json_object_set_new(res, "description", json_string(common_resolutions[i].description));
-        json_array_append_new(resolutions, res);
+    // Try to get the source pad to query capabilities
+    GstPad *src_pad = gst_element_get_static_pad(src, "src");
+    if (src_pad) {
+        // Set element to READY state to allow caps negotiation
+        GstStateChangeReturn ret = gst_element_set_state(src, GST_STATE_READY);
+        if (ret != GST_STATE_CHANGE_FAILURE) {
+            // Get the pad template caps
+            GstPadTemplate *pad_template = gst_element_class_get_pad_template(
+                GST_ELEMENT_GET_CLASS(src), "src");
+            if (pad_template) {
+                GstCaps *template_caps = gst_pad_template_get_caps(pad_template);
+                if (template_caps) {
+                    g_print("Probing camera capabilities for %s\n", camera_name ? camera_name : "auto-detect");
+                    
+                    // Parse the caps to extract supported resolutions
+                    guint num_structures = gst_caps_get_size(template_caps);
+                    for (guint i = 0; i < num_structures; i++) {
+                        GstStructure *structure = gst_caps_get_structure(template_caps, i);
+                        const gchar *format_name = gst_structure_get_name(structure);
+                        
+                        // Only process video/x-raw structures
+                        if (g_str_has_prefix(format_name, "video/x-raw")) {
+                            const GValue *width_val = gst_structure_get_value(structure, "width");
+                            const GValue *height_val = gst_structure_get_value(structure, "height");
+                            const GValue *framerate_val = gst_structure_get_value(structure, "framerate");
+                            
+                            if (width_val && height_val) {
+                                // Handle different value types (int, int range, list)
+                                if (G_VALUE_HOLDS_INT(width_val) && G_VALUE_HOLDS_INT(height_val)) {
+                                    int width = g_value_get_int(width_val);
+                                    int height = g_value_get_int(height_val);
+                                    int max_fps = 30; // default
+                                    
+                                    if (framerate_val && GST_VALUE_HOLDS_FRACTION(framerate_val)) {
+                                        max_fps = gst_value_get_fraction_numerator(framerate_val) / 
+                                                gst_value_get_fraction_denominator(framerate_val);
+                                    }
+                                    
+                                    json_t *res = json_object();
+                                    json_object_set_new(res, "width", json_integer(width));
+                                    json_object_set_new(res, "height", json_integer(height));
+                                    json_object_set_new(res, "max_framerate", json_integer(max_fps));
+                                    json_object_set_new(res, "format", json_string("probed"));
+                                    json_array_append_new(resolutions, res);
+                                    
+                                    g_print("Found resolution: %dx%d@%dfps\n", width, height, max_fps);
+                                }
+                                else if (GST_VALUE_HOLDS_INT_RANGE(width_val) && GST_VALUE_HOLDS_INT_RANGE(height_val)) {
+                                    int min_width = gst_value_get_int_range_min(width_val);
+                                    int max_width = gst_value_get_int_range_max(width_val);
+                                    int min_height = gst_value_get_int_range_min(height_val);
+                                    int max_height = gst_value_get_int_range_max(height_val);
+                                    
+                                    g_print("Found resolution range: %dx%d to %dx%d\n", 
+                                           min_width, min_height, max_width, max_height);
+                                    
+                                    // Add some common resolutions within the range
+                                    typedef struct { int w, h, fps; } common_res_t;
+                                    common_res_t test_resolutions[] = {
+                                        {640, 480, 60}, {1280, 720, 60}, {1920, 1080, 30},
+                                        {2304, 1296, 25}, {4608, 2592, 10}, {0, 0, 0}
+                                    };
+                                    
+                                    for (int j = 0; test_resolutions[j].w > 0; j++) {
+                                        if (test_resolutions[j].w >= min_width && test_resolutions[j].w <= max_width &&
+                                            test_resolutions[j].h >= min_height && test_resolutions[j].h <= max_height) {
+                                            
+                                            json_t *res = json_object();
+                                            json_object_set_new(res, "width", json_integer(test_resolutions[j].w));
+                                            json_object_set_new(res, "height", json_integer(test_resolutions[j].h));
+                                            json_object_set_new(res, "max_framerate", json_integer(test_resolutions[j].fps));
+                                            json_object_set_new(res, "format", json_string("range-tested"));
+                                            json_array_append_new(resolutions, res);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    gst_caps_unref(template_caps);
+                }
+            }
+        } else {
+            g_printerr("Failed to set camera to READY state for capability probing\n");
+        }
+        
+        gst_element_set_state(src, GST_STATE_NULL);
+        gst_object_unref(src_pad);
+    }
+    
+    gst_object_unref(src);
+    
+    // If no resolutions were probed, provide minimal fallback
+    if (json_array_size(resolutions) == 0) {
+        g_print("No resolutions probed, adding basic fallbacks\n");
+        
+        typedef struct { int w; int h; int fps; const char* desc; } fallback_res_t;
+        fallback_res_t fallback_resolutions[] = {
+            {640, 480, 30, "VGA (basic fallback)"},
+            {1280, 720, 30, "HD (basic fallback)"},
+            {1920, 1080, 15, "Full HD (basic fallback)"},
+            {0, 0, 0, NULL}
+        };
+        
+        for (int i = 0; fallback_resolutions[i].w > 0; i++) {
+            json_t *res = json_object();
+            json_object_set_new(res, "width", json_integer(fallback_resolutions[i].w));
+            json_object_set_new(res, "height", json_integer(fallback_resolutions[i].h));
+            json_object_set_new(res, "max_framerate", json_integer(fallback_resolutions[i].fps));
+            json_object_set_new(res, "description", json_string(fallback_resolutions[i].desc));
+            json_array_append_new(resolutions, res);
+        }
     }
     
     return resolutions;
