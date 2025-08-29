@@ -62,11 +62,17 @@ else
     exit 1
 fi
 
+# Get the primary group of the user for the service file
+USER_PRIMARY_GROUP=$(id -gn $REAL_USER)
+echo "Primary group for $REAL_USER: $USER_PRIMARY_GROUP"
+
 # Install service file
 echo "5. Installing systemd service..."
-# Process service file - replace REPLACE_WITH_USER with actual user
-sed "s/REPLACE_WITH_USER/$REAL_USER/g" f1sh-camera-tx.service > /etc/systemd/system/f1sh-camera-tx.service
-echo "Service file installed with user: $REAL_USER"
+# Process service file - replace placeholders with actual user/group
+sed -e "s/REPLACE_WITH_USER/$REAL_USER/g" \
+    -e "s/Group=video/Group=$USER_PRIMARY_GROUP/g" \
+    f1sh-camera-tx.service > /etc/systemd/system/f1sh-camera-tx.service
+echo "Service file installed with user: $REAL_USER, group: $USER_PRIMARY_GROUP"
 systemctl daemon-reload
 
 # Test GStreamer plugins
@@ -86,7 +92,23 @@ done
 
 # Add user to required groups
 echo "7. Adding user to required groups..."
-usermod -a -G video,render,gpio $REAL_USER || echo "Some groups may not exist, continuing..."
+
+# Function to add user to group if group exists
+add_to_group_if_exists() {
+    local group=$1
+    if getent group "$group" >/dev/null 2>&1; then
+        usermod -a -G "$group" $REAL_USER
+        echo "  ✓ Added $REAL_USER to group: $group"
+    else
+        echo "  ⚠ Group $group does not exist, skipping"
+    fi
+}
+
+# Add to standard groups
+add_to_group_if_exists "video"
+add_to_group_if_exists "audio"
+add_to_group_if_exists "render"
+add_to_group_if_exists "gpio"
 
 # Test manual execution
 echo "8. Testing manual execution..."
