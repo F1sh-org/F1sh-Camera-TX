@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
+User=REPLACE_WITH_USER
 Group=video
 WorkingDirectory=/etc/f1sh-camera-tx
 ExecStart=/etc/f1sh-camera-tx/F1sh-Camera-TX

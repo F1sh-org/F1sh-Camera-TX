@@ -58,13 +58,15 @@ if [ -f "build/F1sh-Camera-TX" ]; then
     chown $REAL_USER:$REAL_USER /etc/f1sh-camera-tx/F1sh-Camera-TX
     chmod +x /etc/f1sh-camera-tx/F1sh-Camera-TX
 else
-    echo "Error: build/F1sh-Camera-TX not found. Please build first with 'ninja -C builddir'"
+    echo "Error: build/F1sh-Camera-TX not found. Please build first with 'ninja -C build'"
     exit 1
 fi
 
 # Install service file
 echo "5. Installing systemd service..."
-cp f1sh-camera-tx.service /etc/systemd/system/
+# Process service file - replace REPLACE_WITH_USER with actual user
+sed "s/REPLACE_WITH_USER/$REAL_USER/g" f1sh-camera-tx.service > /etc/systemd/system/f1sh-camera-tx.service
+echo "Service file installed with user: $REAL_USER"
 systemctl daemon-reload
 
 # Test GStreamer plugins
