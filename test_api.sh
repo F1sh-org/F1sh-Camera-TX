@@ -11,29 +11,35 @@ echo "1. Testing health check..."
 curl -s "$API_BASE/health" | python3 -m json.tool
 echo -e "\n"
 
-echo "2. Getting available cameras and encoders..."
+echo "2. Getting dynamically detected cameras and encoders..."
 curl -s "$API_BASE/get" | python3 -m json.tool
 echo -e "\n"
 
-echo "3. Getting camera-specific information..."
-curl -s "$API_BASE/get/auto-detect" | python3 -m json.tool
+echo "3. Testing dynamic camera detection for specific camera..."
+# First get the first available camera from the list
+FIRST_CAMERA=$(curl -s "$API_BASE/get" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['cameras'][0] if data['cameras'] else 'auto-detect')")
+echo "Testing camera: $FIRST_CAMERA"
+curl -s "$API_BASE/get/$FIRST_CAMERA" | python3 -m json.tool
 echo -e "\n"
 
 echo "4. Getting current statistics..."
 curl -s "$API_BASE/stats" | python3 -m json.tool
 echo -e "\n"
 
-echo "5. Testing configuration update (software encoder)..."
+echo "5. Testing configuration with dynamically detected encoder..."
+# Get the first available encoder
+FIRST_ENCODER=$(curl -s "$API_BASE/get" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['encoders'][0] if data['encoders'] else 'v4l2h264enc')")
+echo "Using encoder: $FIRST_ENCODER"
 curl -s -X POST "$API_BASE/config" \
   -H "Content-Type: application/json" \
-  -d '{
-    "host": "127.0.0.1",
-    "port": 5000,
-    "encoder": "x264enc",
-    "width": 1280,
-    "height": 720,
-    "framerate": 30
-  }' | python3 -m json.tool
+  -d "{
+    \"host\": \"127.0.0.1\",
+    \"port\": 5000,
+    \"encoder\": \"$FIRST_ENCODER\",
+    \"width\": 1280,
+    \"height\": 720,
+    \"framerate\": 30
+  }" | python3 -m json.tool
 echo -e "\n"
 
 echo "6. Testing UDP destination update only..."

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <microhttpd.h>
 #include <jansson.h>
+#include <glob.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -120,58 +121,115 @@ void free_stats(StreamStats *stats) {
 }
 
 // Get available libcamera cameras
-static json_t* get_available_cameras() {
+static json_t* get_available_cameras(void) {
     json_t *cameras = json_array();
     
-    // Create a temporary libcamerasrc element to query available cameras
+    // Create a temporary libcamerasrc element to query device properties
     GstElement *src = gst_element_factory_make("libcamerasrc", "temp_src");
     if (src) {
-        // Get the camera-name property to see available cameras
+        // Try to get the device property which might list available cameras
         GParamSpec *pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), "camera-name");
-        if (pspec && G_IS_PARAM_SPEC_STRING(pspec)) {
-            // Try to enumerate cameras by testing different camera names
-            // This is a simplified approach - in practice, libcamera provides better APIs
-            const gchar *common_cameras[] = {
-                "/base/soc/i2c0mux/i2c@1/imx708@1a",  // Pi Camera Module 3
-                "/base/soc/i2c0mux/i2c@1/imx219@10",  // Pi Camera Module v2
-                "/base/soc/i2c0mux/i2c@1/ov5647@36",  // Pi Camera Module v1
-                NULL
-            };
-            
-            for (int i = 0; common_cameras[i]; i++) {
-                json_array_append_new(cameras, json_string(common_cameras[i]));
+        if (pspec) {
+            // Get current camera name (default)
+            gchar *current_camera = NULL;
+            g_object_get(src, "camera-name", &current_camera, NULL);
+            if (current_camera && strlen(current_camera) > 0) {
+                json_array_append_new(cameras, json_string(current_camera));
+                g_free(current_camera);
             }
         }
+        
+        // Also check for common camera paths by trying to enumerate /sys/class/video4linux
+        // This helps find additional cameras that might be available
+        glob_t glob_result;
+        if (glob("/sys/class/video4linux/video*", GLOB_NOSORT, NULL, &glob_result) == 0) {
+            for (size_t i = 0; i < glob_result.gl_pathc; i++) {
+                // Extract video device number and create potential libcamera names
+                gchar *path = glob_result.gl_pathv[i];
+                gchar *basename = g_path_get_basename(path);
+                
+                // For Raspberry Pi, common camera paths include:
+                if (strstr(basename, "video0") || strstr(basename, "video10") || strstr(basename, "video11")) {
+                    // These might correspond to libcamera devices
+                    json_array_append_new(cameras, json_string("auto-detect"));
+                    break; // Only add once
+                }
+                g_free(basename);
+            }
+            globfree(&glob_result);
+        }
+        
         gst_object_unref(src);
     }
     
-    // If no specific cameras found, add a generic entry
+    // If no cameras found, add auto-detect as fallback
     if (json_array_size(cameras) == 0) {
         json_array_append_new(cameras, json_string("auto-detect"));
+    }
+    
+    // Add common Pi camera device paths as potential options
+    const gchar *common_cameras[] = {
+        "/base/soc/i2c0mux/i2c@1/imx708@1a",  // Pi Camera Module 3
+        "/base/soc/i2c0mux/i2c@1/imx219@10",  // Pi Camera Module v2
+        "/base/soc/i2c0mux/i2c@1/ov5647@36",  // Pi Camera Module v1
+        NULL
+    };
+    
+    for (int i = 0; common_cameras[i]; i++) {
+        // Check if this camera path is not already in the list
+        gboolean found = FALSE;
+        size_t array_size = json_array_size(cameras);
+        for (size_t j = 0; j < array_size; j++) {
+            json_t *item = json_array_get(cameras, j);
+            const char *existing = json_string_value(item);
+            if (existing && strcmp(existing, common_cameras[i]) == 0) {
+                found = TRUE;
+                break;
+            }
+        }
+        if (!found) {
+            json_array_append_new(cameras, json_string(common_cameras[i]));
+        }
     }
     
     return cameras;
 }
 
 // Get available encoders
-static json_t* get_available_encoders() {
+static json_t* get_available_encoders(void) {
     json_t *encoders = json_array();
     
+    // List of potential encoders to check for availability
     const gchar *encoder_list[] = {
-        "v4l2h264enc",
-        "x264enc",
+        "v4l2h264enc",    // Hardware encoder (Pi default)
+        "omxh264enc",     // OpenMAX encoder (Pi legacy)
+        "x264enc",        // Software encoder
         "nvh264enc",      // NVIDIA hardware encoder
         "vaapih264enc",   // Intel VAAPI encoder
-        "omxh264enc",     // OpenMAX encoder
+        "qsvh264enc",     // Intel Quick Sync encoder
+        "vtenc_h264",     // Apple VideoToolbox encoder (macOS)
+        "mfh264enc",      // Microsoft Media Foundation encoder (Windows)
         NULL
     };
     
     for (int i = 0; encoder_list[i]; i++) {
         GstElementFactory *factory = gst_element_factory_find(encoder_list[i]);
         if (factory) {
-            json_array_append_new(encoders, json_string(encoder_list[i]));
+            // Double-check by trying to create the element
+            GstElement *test_element = gst_element_factory_create(factory, "test");
+            if (test_element) {
+                json_array_append_new(encoders, json_string(encoder_list[i]));
+                gst_object_unref(test_element);
+                g_print("Found available encoder: %s\n", encoder_list[i]);
+            }
             gst_object_unref(factory);
         }
+    }
+    
+    // If no encoders found (unlikely), add x264enc as it's usually available
+    if (json_array_size(encoders) == 0) {
+        g_print("Warning: No H.264 encoders detected, adding x264enc as fallback\n");
+        json_array_append_new(encoders, json_string("x264enc"));
     }
     
     return encoders;
@@ -181,18 +239,49 @@ static json_t* get_available_encoders() {
 static json_t* get_camera_resolutions(const gchar *camera_name) {
     json_t *resolutions = json_array();
     
-    // Common resolutions supported by most Pi cameras
+    // Try to probe actual capabilities if possible
+    GstElement *src = gst_element_factory_make("libcamerasrc", "probe_src");
+    if (src && camera_name && strcmp(camera_name, "auto-detect") != 0) {
+        g_object_set(src, "camera-name", camera_name, NULL);
+        
+        // Try to get caps from the source pad
+        GstPad *src_pad = gst_element_get_static_pad(src, "src");
+        if (src_pad) {
+            // This would ideally query the actual caps, but libcamerasrc 
+            // needs to be in a certain state. For now, we'll use common resolutions.
+            gst_object_unref(src_pad);
+        }
+        gst_object_unref(src);
+    }
+    
+    // Provide comprehensive resolution list based on common camera capabilities
     const struct {
         int width;
         int height;
         int max_framerate;
+        const char *description;
     } common_resolutions[] = {
-        {640, 480, 90},
-        {1280, 720, 60},
-        {1920, 1080, 30},
-        {2304, 1296, 25},  // Pi Camera Module 3 native
-        {4608, 2592, 10},  // Pi Camera Module 3 full resolution
-        {0, 0, 0}  // End marker
+        // Low resolution - high framerate
+        {320, 240, 120, "QVGA (very low res, high fps)"},
+        {640, 480, 90, "VGA (low res, high fps)"},
+        {800, 600, 60, "SVGA"},
+        
+        // Medium resolution
+        {1024, 768, 60, "XGA"},
+        {1280, 720, 60, "HD 720p"},
+        {1280, 960, 30, "SXGA"},
+        {1920, 1080, 30, "Full HD 1080p"},
+        
+        // High resolution (Pi Camera Module 3 specific)
+        {2304, 1296, 25, "Pi Cam v3 native (4:3)"},
+        {2592, 1944, 15, "Pi Cam v3 still mode"},
+        {4608, 2592, 10, "Pi Cam v3 full resolution"},
+        
+        // Ultra-wide and other formats
+        {1640, 1232, 30, "Pi Cam v3 wide"},
+        {1640, 922, 40, "Pi Cam v3 16:9 crop"},
+        
+        {0, 0, 0, NULL}  // End marker
     };
     
     for (int i = 0; common_resolutions[i].width > 0; i++) {
@@ -200,6 +289,7 @@ static json_t* get_camera_resolutions(const gchar *camera_name) {
         json_object_set_new(res, "width", json_integer(common_resolutions[i].width));
         json_object_set_new(res, "height", json_integer(common_resolutions[i].height));
         json_object_set_new(res, "max_framerate", json_integer(common_resolutions[i].max_framerate));
+        json_object_set_new(res, "description", json_string(common_resolutions[i].description));
         json_array_append_new(resolutions, res);
     }
     
@@ -527,9 +617,6 @@ static gboolean build_and_run_pipeline(CustomData *data) {
                                "width", G_TYPE_INT, data->config.width,
                                "height", G_TYPE_INT, data->config.height,
                                "framerate", GST_TYPE_FRACTION, data->config.framerate, 1,
-                               "format", G_TYPE_STRING, "YUY2",
-                               "colorimetry", G_TYPE_STRING, "bt709",
-                               "interlace-mode", G_TYPE_STRING, "progressive",
                                NULL);
     
     gchar *caps_str = gst_caps_to_string(caps);
