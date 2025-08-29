@@ -1,0 +1,167 @@
+name: Build and Release
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up cross-compilation for ARM64
+      if: matrix.arch == 'arm64'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+        echo "CXX=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+        echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          meson \
+          ninja-build \
+          pkg-config \
+          libgstreamer1.0-dev \
+          libgstreamer-plugins-base1.0-dev \
+          libgstreamer-plugins-bad1.0-dev \
+          libmicrohttpd-dev \
+          libjansson-dev
+
+    - name: Install ARM64 dependencies
+      if: matrix.arch == 'arm64'
+      run: |
+        sudo dpkg --add-architecture arm64
+        sudo apt-get update
+        sudo apt-get install -y \
+          libgstreamer1.0-dev:arm64 \
+          libgstreamer-plugins-base1.0-dev:arm64 \
+          libgstreamer-plugins-bad1.0-dev:arm64 \
+          libmicrohttpd-dev:arm64 \
+          libjansson-dev:arm64
+
+    - name: Create cross-compilation file for ARM64
+      if: matrix.arch == 'arm64'
+      run: |
+        cat > cross-arm64.txt << EOF
+        [binaries]
+        c = 'aarch64-linux-gnu-gcc'
+        cpp = 'aarch64-linux-gnu-g++'
+        ar = 'aarch64-linux-gnu-ar'
+        strip = 'aarch64-linux-gnu-strip'
+        pkgconfig = 'aarch64-linux-gnu-pkg-config'
+
+        [host_machine]
+        system = 'linux'
+        cpu_family = 'aarch64'
+        cpu = 'aarch64'
+        endian = 'little'
+        EOF
+
+    - name: Setup build directory (AMD64)
+      if: matrix.arch == 'amd64'
+      run: meson setup build
+
+    - name: Setup build directory (ARM64)
+      if: matrix.arch == 'arm64'
+      run: meson setup build --cross-file cross-arm64.txt
+
+    - name: Build
+      run: meson compile -C build
+
+    - name: Create artifact directory
+      run: |
+        mkdir -p artifacts
+        cp build/F1sh-Camera-TX artifacts/F1sh-Camera-TX-linux-${{ matrix.arch }}
+        cp f1sh-camera-tx.service artifacts/
+        cp install_service.sh artifacts/
+        chmod +x artifacts/install_service.sh
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: f1sh-camera-tx-linux-${{ matrix.arch }}
+        path: artifacts/
+
+    - name: Create release archive
+      run: |
+        cd artifacts
+        tar -czf ../F1sh-Camera-TX-linux-${{ matrix.arch }}.tar.gz *
+
+    - name: Upload to release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: F1sh-Camera-TX-linux-${{ matrix.arch }}.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-raspberry-pi:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up QEMU for ARM emulation
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build in Raspberry Pi environment
+      run: |
+        docker run --rm --platform linux/arm64 \
+          -v ${{ github.workspace }}:/workspace \
+          -w /workspace \
+          arm64v8/ubuntu:22.04 \
+          bash -c "
+            apt-get update && \
+            apt-get install -y \
+              meson \
+              ninja-build \
+              pkg-config \
+              gcc \
+              g++ \
+              libgstreamer1.0-dev \
+              libgstreamer-plugins-base1.0-dev \
+              libgstreamer-plugins-bad1.0-dev \
+              libmicrohttpd-dev \
+              libjansson-dev && \
+            meson setup build && \
+            meson compile -C build
+          "
+
+    - name: Create Raspberry Pi artifacts
+      run: |
+        mkdir -p artifacts-rpi
+        cp build/F1sh-Camera-TX artifacts-rpi/F1sh-Camera-TX-raspberry-pi
+        cp f1sh-camera-tx.service artifacts-rpi/
+        cp install_service.sh artifacts-rpi/
+        chmod +x artifacts-rpi/install_service.sh
+
+    - name: Upload Raspberry Pi artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: f1sh-camera-tx-raspberry-pi
+        path: artifacts-rpi/
+
+    - name: Create Raspberry Pi release archive
+      run: |
+        cd artifacts-rpi
+        tar -czf ../F1sh-Camera-TX-raspberry-pi.tar.gz *
+
+    - name: Upload Raspberry Pi build to release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: F1sh-Camera-TX-raspberry-pi.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
