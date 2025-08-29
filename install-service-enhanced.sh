@@ -53,12 +53,12 @@ chown $REAL_USER:$REAL_USER /etc/f1sh-camera-tx
 
 # Copy binary
 echo "4. Copying application binary..."
-if [ -f "builddir/F1sh-Camera-TX" ]; then
-    cp builddir/F1sh-Camera-TX /etc/f1sh-camera-tx/
+if [ -f "build/F1sh-Camera-TX" ]; then
+    cp build/F1sh-Camera-TX /etc/f1sh-camera-tx/
     chown $REAL_USER:$REAL_USER /etc/f1sh-camera-tx/F1sh-Camera-TX
     chmod +x /etc/f1sh-camera-tx/F1sh-Camera-TX
 else
-    echo "Error: builddir/F1sh-Camera-TX not found. Please build first with 'ninja -C builddir'"
+    echo "Error: build/F1sh-Camera-TX not found. Please build first with 'ninja -C builddir'"
     exit 1
 fi
 
