@@ -380,7 +380,7 @@ static enum MHD_Result send_json_response(struct MHD_Connection *connection, con
 
 // Handle health check
 static enum MHD_Result handle_health(struct MHD_Connection *connection) {
-    return send_json_response(connection, "{\"status\":\"healthy\",\"service\":\"F1sh-Camera-TX\"}", MHD_HTTP_OK);
+    return send_json_response(connection, "{\"status\":\"healthy\"}", MHD_HTTP_OK);
 }
 
 // Handle statistics
@@ -747,7 +747,7 @@ static gboolean build_and_run_pipeline(CustomData *data) {
                      "key-int-max", 30,   // GOP size
                      NULL);
     } else if (strcmp(actual_encoder_name, "v4l2h264enc") == 0) {
-        g_print("Configuring v4l2h264enc encoder (matching old working version)\n");
+        g_print("Configuring v4l2h264enc encoder\n");
         // Use the exact same settings as the old working version
         GstStructure *ctrls = gst_structure_new("controls", 
                                                "repeat_sequence_header", G_TYPE_BOOLEAN, TRUE,
