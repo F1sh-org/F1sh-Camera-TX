@@ -1,5 +1,4 @@
 #include <gst/gst.h>
-#include <gst/video/video.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +28,6 @@ typedef struct {
     gint width;
     gint height;
     gint framerate;
-    gchar *flip; // none | horizontal-flip | vertical-flip | rotate-180
 } AppConfig;
 
 // Statistics structure
@@ -101,14 +99,12 @@ void init_config(AppConfig *config) {
     config->width = DEFAULT_WIDTH;
     config->height = DEFAULT_HEIGHT;
     config->framerate = DEFAULT_FRAMERATE;
-    config->flip = g_strdup("none");
 }
 
 void free_config_members(AppConfig *config) {
     g_free(config->host);
     g_free(config->camera_name);
     g_free(config->encoder_type);
-    g_free(config->flip);
 }
 
 // Initialize statistics
@@ -539,21 +535,11 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         }
     }
 
-    value = json_object_get(root, "flip");
-    if (json_is_string(value)) {
-        str_val = json_string_value(value);
-        if (g_strcmp0(data->config.flip, str_val) != 0) {
-            g_free(data->config.flip);
-            data->config.flip = g_strdup(str_val);
-            needs_pipeline_rebuild = TRUE;
-        }
-    }
-
     // Decide what kind of update to perform
     if (needs_pipeline_rebuild) {
-    g_print("Configuration change requires pipeline rebuild: host=%s, port=%d, camera=%s, encoder=%s, %dx%d@%dfps, flip=%s\n", 
-        data->config.host, data->config.port, data->config.camera_name, data->config.encoder_type,
-        data->config.width, data->config.height, data->config.framerate, data->config.flip);
+        g_print("Configuration change requires pipeline rebuild: host=%s, port=%d, camera=%s, encoder=%s, %dx%d@%dfps\n", 
+                data->config.host, data->config.port, data->config.camera_name, data->config.encoder_type,
+                data->config.width, data->config.height, data->config.framerate);
         data->pipeline_is_restarting = TRUE;
     } else if (needs_udp_update && data->pipeline) {
         g_print("Updating UDP sink destination: %s:%d (no pipeline rebuild needed)\n", 
@@ -671,7 +657,7 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         return FALSE;
     }
 
-    GstElement *src, *capsfilter, *convert, *flip_elem, *encoder, *encoder_caps, *parser, *payloader, *sink;
+    GstElement *src, *capsfilter, *convert, *encoder, *encoder_caps, *parser, *payloader, *sink;
     GstCaps *caps;
 
     src = gst_element_factory_make("libcamerasrc", "source");
@@ -712,43 +698,6 @@ static gboolean build_and_run_pipeline(CustomData *data) {
     if (!convert) {
         g_printerr("Failed to create videoconvert element.\n");
         goto error;
-    }
-
-    // Optional flip
-    flip_elem = NULL;
-    gboolean use_flip = data->config.flip && g_strcmp0(data->config.flip, "none") != 0;
-    if (use_flip) {
-        flip_elem = gst_element_factory_make("videoflip", "flip");
-        if (!flip_elem) {
-            g_printerr("Failed to create videoflip element, continuing without flip.\n");
-            use_flip = FALSE;
-        } else {
-            // Map string to orientation enum
-            gint method = GST_VIDEO_ORIENTATION_IDENTITY;
-            if (g_strcmp0(data->config.flip, "horizontal-flip") == 0) {
-                method = GST_VIDEO_ORIENTATION_HORIZ;
-            } else if (g_strcmp0(data->config.flip, "vertical-flip") == 0) {
-                method = GST_VIDEO_ORIENTATION_VERT;
-            } else if (g_strcmp0(data->config.flip, "rotate-180") == 0) {
-                method = GST_VIDEO_ORIENTATION_180;
-            } else if (g_strcmp0(data->config.flip, "clockwise") == 0) {
-                method = GST_VIDEO_ORIENTATION_90R;
-            } else if (g_strcmp0(data->config.flip, "counterclockwise") == 0) {
-                method = GST_VIDEO_ORIENTATION_90L;
-            } else if (g_strcmp0(data->config.flip, "automatic") == 0) {
-                method = GST_VIDEO_ORIENTATION_AUTO;
-            } else if (g_strcmp0(data->config.flip, "none") == 0) {
-                method = GST_VIDEO_ORIENTATION_IDENTITY;
-            } else {
-                g_print("Unknown flip method '%s', disabling flip.\n", data->config.flip);
-                use_flip = FALSE;
-            }
-            if (use_flip) {
-                // videoflip implements the GstVideoDirection interface property
-                g_object_set(flip_elem, "video-direction", method, NULL);
-                g_print("Applying flip: %s (video-direction=%d)\n", data->config.flip, method);
-            }
-        }
     }
 
     // Try encoders in order of preference with better error handling
@@ -869,21 +818,11 @@ static gboolean build_and_run_pipeline(CustomData *data) {
         gst_object_unref(sink_pad);
     }
 
-    if (use_flip && flip_elem) {
-        gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, convert, flip_elem, encoder, encoder_caps, parser, payloader, sink, NULL);
-    } else {
-        gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, convert, encoder, encoder_caps, parser, payloader, sink, NULL);
-    }
+    gst_bin_add_many(GST_BIN(data->pipeline), src, capsfilter, convert, encoder, encoder_caps, parser, payloader, sink, NULL);
     g_print("All elements added to pipeline\n");
 
     g_print("Attempting to link pipeline elements...\n");
-    gboolean link_ok = FALSE;
-    if (use_flip && flip_elem) {
-        link_ok = gst_element_link_many(src, capsfilter, convert, flip_elem, encoder, encoder_caps, parser, payloader, sink, NULL);
-    } else {
-        link_ok = gst_element_link_many(src, capsfilter, convert, encoder, encoder_caps, parser, payloader, sink, NULL);
-    }
-    if (!link_ok) {
+    if (!gst_element_link_many(src, capsfilter, convert, encoder, encoder_caps, parser, payloader, sink, NULL)) {
         g_printerr("Failed to link elements.\n");
         goto error;
     } else {
