@@ -89,7 +89,7 @@ configure_usb_serial_gadget() {
 # Main script execution starts here
 check_sudo
 check_os
-
+configure_usb_serial_gadget
 # Update and upgrade packages
 echo "Updating and upgrading packages..."
 apt update && apt upgrade -y
