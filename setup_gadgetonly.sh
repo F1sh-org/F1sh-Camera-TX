@@ -27,6 +27,11 @@ echo_step() {
 }
 
 confirm_action() {
+    # If not running interactively, assume "yes"
+    if [ ! -t 0 ]; then
+        echo_info "No interactive terminal detected. Automatically confirming: $1"
+        return 0
+    fi
     while true; do
         read -p "${YELLOW}$1 (y/n): ${NC}" yn
         case $yn in
