@@ -32,7 +32,7 @@ ProtectControlGroups=false
 RestrictRealtime=false
 
 # Supplementary groups for device access
-SupplementaryGroups=video audio render gpio
+SupplementaryGroups=video audio render gpio tty dialout
 
 [Install]
 WantedBy=multi-user.target
