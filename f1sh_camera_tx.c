@@ -1,16 +1,22 @@
+#include <errno.h>
+#include <fcntl.h>
+#include <glob.h>
 #include <gst/gst.h>
+#include <jansson.h>
+#include <microhttpd.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <microhttpd.h>
-#include <jansson.h>
-#include <glob.h>
+#include <termios.h>
+#include <unistd.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
 
 #define HTTP_PORT 8888
+#define DEFAULT_SERIAL_DEVICE "/dev/ttyGS0"
 
 // Default configuration
 #define DEFAULT_HOST "127.0.0.1"
@@ -39,6 +45,14 @@ typedef struct _StreamStats {
     GMutex stats_mutex;
 } StreamStats;
 
+typedef struct {
+    int fd;
+    GThread *thread;
+    GMutex write_mutex;
+    gint running;
+    gchar *device_path;
+} SerialContext;
+
 typedef struct _CustomData {
     GstElement *pipeline;
     GstBus *bus;
@@ -48,6 +62,7 @@ typedef struct _CustomData {
     GMutex state_mutex;
     gboolean pipeline_is_restarting;
     gboolean should_terminate;
+    SerialContext serial;
 } CustomData;
 
 struct connection_info_struct {
@@ -62,6 +77,14 @@ static void init_config(AppConfig *config);
 static void free_config_members(AppConfig *config);
 static void init_stats(StreamStats *stats);
 static void free_stats(StreamStats *stats);
+static gboolean configure_serial_port(int fd);
+static gboolean init_serial_context(CustomData *data);
+static void shutdown_serial_context(CustomData *data);
+static gboolean serial_send_json(CustomData *data, json_t *message);
+static gpointer serial_reader_thread(gpointer user_data);
+static void handle_serial_message(CustomData *data, const char *payload, size_t length);
+static gboolean process_serial_request(CustomData *data, json_t *message);
+static gboolean respond_with_status(CustomData *data, gint status_code);
 
 // Probe callback to monitor data flow
 static GstPadProbeReturn
@@ -118,6 +141,244 @@ void init_stats(StreamStats *stats) {
 
 void free_stats(StreamStats *stats) {
     g_mutex_clear(&stats->stats_mutex);
+}
+
+static gboolean configure_serial_port(int fd) {
+    struct termios tty;
+    if (tcgetattr(fd, &tty) != 0) {
+        g_printerr("Serial: tcgetattr failed: %s\n", g_strerror(errno));
+        return FALSE;
+    }
+
+    cfmakeraw(&tty);
+    cfsetispeed(&tty, B115200);
+    cfsetospeed(&tty, B115200);
+    tty.c_cflag |= (CLOCAL | CREAD);
+    tty.c_cflag &= ~CRTSCTS;
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 5; // 0.5 second read timeout
+
+    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+        g_printerr("Serial: tcsetattr failed: %s\n", g_strerror(errno));
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static gboolean serial_send_json(CustomData *data, json_t *message) {
+    SerialContext *serial = &data->serial;
+    if (serial->fd < 0 || !g_atomic_int_get(&serial->running)) {
+        g_printerr("Serial: not ready, cannot send response\n");
+        return FALSE;
+    }
+
+    char *json_str = json_dumps(message, JSON_COMPACT);
+    if (!json_str) {
+        g_printerr("Serial: failed to serialize JSON response\n");
+        return FALSE;
+    }
+
+    size_t payload_len = strlen(json_str);
+    gboolean success = FALSE;
+
+    g_mutex_lock(&serial->write_mutex);
+    if (serial->fd >= 0) {
+        ssize_t written = write(serial->fd, json_str, payload_len);
+        if (written == (ssize_t)payload_len) {
+            ssize_t newline_written = write(serial->fd, "\n", 1);
+            if (newline_written == 1) {
+                success = TRUE;
+            }
+        }
+    }
+    g_mutex_unlock(&serial->write_mutex);
+
+    free(json_str);
+
+    if (!success) {
+        g_printerr("Serial: failed to send response\n");
+    }
+
+    return success;
+}
+
+static gboolean respond_with_status(CustomData *data, gint status_code) {
+    json_t *response = json_object();
+    json_object_set_new(response, "status", json_integer(status_code));
+    gboolean success = serial_send_json(data, response);
+    json_decref(response);
+    return success;
+}
+
+static gboolean process_serial_request(CustomData *data, json_t *message) {
+    json_t *status_value = json_object_get(message, "status");
+    if (!json_is_integer(status_value)) {
+        g_printerr("Serial: missing integer status field\n");
+        return FALSE;
+    }
+
+    gint status_code = (gint)json_integer_value(status_value);
+
+    switch (status_code) {
+        case 1: {
+            json_t *payload = json_object_get(message, "payload");
+            if (payload && !json_is_null(payload)) {
+                g_print("Serial: status 1 ignores payload for now\n");
+            }
+            g_print("Serial: received status 1 request\n");
+            // No payload required for this status; simple echo response.
+            return respond_with_status(data, 1);
+        }
+        default: {
+            json_t *payload = json_object_get(message, "payload");
+            g_print("Serial: unhandled status code %d\n", status_code);
+            if (payload && !json_is_null(payload)) {
+                g_print("Serial: payload present for status %d but no handler implemented yet\n", status_code);
+            }
+            break;
+        }
+    }
+
+    return TRUE;
+}
+
+static void handle_serial_message(CustomData *data, const char *payload, size_t length) {
+    json_error_t error;
+    json_t *root = json_loadb(payload, length, JSON_DECODE_ANY, &error);
+    if (!root) {
+        g_printerr("Serial: JSON parse error near line %d: %s\n", error.line, error.text);
+        return;
+    }
+
+    if (!json_is_object(root)) {
+        g_printerr("Serial: received non-object JSON payload\n");
+        json_decref(root);
+        return;
+    }
+
+    if (!process_serial_request(data, root)) {
+        g_printerr("Serial: failed to handle request\n");
+    }
+
+    json_decref(root);
+}
+
+static gpointer serial_reader_thread(gpointer user_data) {
+    CustomData *data = (CustomData *)user_data;
+    SerialContext *serial = &data->serial;
+    GString *buffer = g_string_new(NULL);
+
+    while (g_atomic_int_get(&serial->running)) {
+        struct pollfd pfd = {
+            .fd = serial->fd,
+            .events = POLLIN,
+            .revents = 0,
+        };
+
+        int poll_ret = poll(&pfd, 1, 250);
+        if (poll_ret > 0 && (pfd.revents & POLLIN)) {
+            char chunk[256];
+            ssize_t bytes_read = read(serial->fd, chunk, sizeof(chunk));
+            if (bytes_read > 0) {
+                g_string_append_len(buffer, chunk, (gssize)bytes_read);
+
+                while (TRUE) {
+                    gchar *newline = memchr(buffer->str, '\n', buffer->len);
+                    if (!newline) {
+                        break;
+                    }
+
+                    gsize newline_pos = (gsize)(newline - buffer->str);
+                    gsize message_len = newline_pos;
+                    while (message_len > 0 && buffer->str[message_len - 1] == '\r') {
+                        message_len--;
+                    }
+
+                    if (message_len > 0) {
+                        handle_serial_message(data, buffer->str, message_len);
+                    }
+
+                    g_string_erase(buffer, 0, newline_pos + 1);
+                }
+
+                if (buffer->len > 8192) {
+                    g_printerr("Serial: dropping oversized partial message (%zu bytes)\n", buffer->len);
+                    g_string_set_size(buffer, 0);
+                }
+            } else if (bytes_read < 0 && errno != EAGAIN && errno != EINTR) {
+                g_printerr("Serial: read error: %s\n", g_strerror(errno));
+                g_usleep(50000);
+            }
+        } else if (poll_ret < 0 && errno != EINTR) {
+            g_printerr("Serial: poll error: %s\n", g_strerror(errno));
+            g_usleep(50000);
+        }
+    }
+
+    g_string_free(buffer, TRUE);
+    return NULL;
+}
+
+static gboolean init_serial_context(CustomData *data) {
+    SerialContext *serial = &data->serial;
+    const gchar *override_path = g_getenv("F1SH_SERIAL_DEVICE");
+
+    if (serial->device_path) {
+        g_free(serial->device_path);
+        serial->device_path = NULL;
+    }
+
+    serial->device_path = g_strdup(override_path ? override_path : DEFAULT_SERIAL_DEVICE);
+    serial->fd = open(serial->device_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (serial->fd < 0) {
+        g_printerr("Serial: failed to open %s: %s\n", serial->device_path, g_strerror(errno));
+        return FALSE;
+    }
+
+    if (!configure_serial_port(serial->fd)) {
+        close(serial->fd);
+        serial->fd = -1;
+        return FALSE;
+    }
+
+    g_atomic_int_set(&serial->running, 1);
+    serial->thread = g_thread_new("serial-reader", serial_reader_thread, data);
+    if (!serial->thread) {
+        g_printerr("Serial: failed to start reader thread\n");
+        g_atomic_int_set(&serial->running, 0);
+        close(serial->fd);
+        serial->fd = -1;
+        return FALSE;
+    }
+
+    g_print("Serial: listening on %s\n", serial->device_path);
+    return TRUE;
+}
+
+static void shutdown_serial_context(CustomData *data) {
+    SerialContext *serial = &data->serial;
+
+    if (g_atomic_int_get(&serial->running)) {
+        g_atomic_int_set(&serial->running, 0);
+    }
+
+    if (serial->thread) {
+        g_thread_join(serial->thread);
+        serial->thread = NULL;
+    }
+
+    if (serial->fd >= 0) {
+        close(serial->fd);
+        serial->fd = -1;
+    }
+
+    if (serial->device_path) {
+        g_free(serial->device_path);
+        serial->device_path = NULL;
+    }
+
+    g_mutex_clear(&serial->write_mutex);
 }
 
 // Get available libcamera cameras
@@ -873,20 +1134,28 @@ int main(int argc, char *argv[]) {
     CustomData data;
     GstBus *bus;
     GstMessage *msg;
+    int exit_code = 0;
 
     gst_init(&argc, &argv);
 
     memset(&data, 0, sizeof(data));
+    data.serial.fd = -1;
     init_config(&data.config);
     init_stats(&data.stats);
     g_mutex_init(&data.state_mutex);
+    g_mutex_init(&data.serial.write_mutex);
     data.should_terminate = FALSE;
+
+    if (!init_serial_context(&data)) {
+        g_printerr("Failed to initialize USB serial interface.\n");
+        exit_code = -1;
+        goto cleanup;
+    }
 
     if (!build_and_run_pipeline(&data)) {
         g_printerr("Failed to start initial pipeline. Exiting.\n");
-        free_config_members(&data.config);
-        g_mutex_clear(&data.state_mutex);
-        return -1;
+        exit_code = -1;
+        goto cleanup;
     }
 
     data.daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD, HTTP_PORT, NULL, NULL,
@@ -895,7 +1164,8 @@ int main(int argc, char *argv[]) {
                                    MHD_OPTION_END);
     if (NULL == data.daemon) {
         g_printerr("Failed to start HTTP server.\n");
-        return -1;
+        exit_code = -1;
+        goto cleanup;
     }
 
     g_print("HTTP server started on port %d\n", HTTP_PORT);
@@ -1001,20 +1271,28 @@ int main(int argc, char *argv[]) {
 
     } while (!data.should_terminate);
 
-    // Cleanup
-    MHD_stop_daemon(data.daemon);
+cleanup:
+    if (data.daemon) {
+        MHD_stop_daemon(data.daemon);
+        data.daemon = NULL;
+    }
+
     g_mutex_lock(&data.state_mutex);
     if (data.pipeline) {
         gst_element_set_state(data.pipeline, GST_STATE_NULL);
         gst_object_unref(data.pipeline);
+        data.pipeline = NULL;
     }
     if (data.bus) {
         gst_object_unref(data.bus);
+        data.bus = NULL;
     }
     g_mutex_unlock(&data.state_mutex);
+
+    shutdown_serial_context(&data);
     free_config_members(&data.config);
     free_stats(&data.stats);
     g_mutex_clear(&data.state_mutex);
 
-    return 0;
+    return exit_code;
 }
