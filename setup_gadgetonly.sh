@@ -134,11 +134,6 @@ configure_usb_serial_gadget() {
         fi
     fi
     
-    # Enable getty service
-    echo_info "Enabling getty service for USB Serial Gadget..."
-    systemctl enable getty@ttyGS0.service
-    echo_info "Getty service enabled for USB Serial Gadget."
-    
     echo_info "USB Serial Gadget configuration completed."
 }
 
