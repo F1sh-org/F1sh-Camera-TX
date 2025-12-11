@@ -109,6 +109,8 @@ static gboolean respond_with_payload(CustomData *data, gint status_code, const c
 static gboolean handle_wifi_scan_request(CustomData *data);
 static gboolean collect_wifi_networks(json_t **result_array);
 static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length);
+static gchar* sanitize_utf8(const gchar *value);
+static void log_serial_json(const char *context, json_t *message);
 
 // Probe callback to monitor data flow
 static GstPadProbeReturn
@@ -394,6 +396,7 @@ static gboolean serial_send_json(CustomData *data, json_t *message) {
 static gboolean respond_with_status(CustomData *data, gint status_code) {
     json_t *response = json_object();
     json_object_set_new(response, "status", json_integer(status_code));
+    log_serial_json("status", response);
     gboolean success = serial_send_json(data, response);
     json_decref(response);
     return success;
@@ -402,10 +405,45 @@ static gboolean respond_with_status(CustomData *data, gint status_code) {
 static gboolean respond_with_payload(CustomData *data, gint status_code, const char *payload) {
     json_t *response = json_object();
     json_object_set_new(response, "status", json_integer(status_code));
-    json_object_set_new(response, "payload", json_string(payload ? payload : ""));
+    const char *payload_value = payload ? payload : "";
+    gchar *sanitized_payload = NULL;
+    if (!g_utf8_validate(payload_value, -1, NULL)) {
+        sanitized_payload = sanitize_utf8(payload_value);
+        payload_value = sanitized_payload ? sanitized_payload : "";
+        g_printerr("Serial: payload contained invalid UTF-8, sanitized before sending\n");
+    }
+
+    json_object_set_new(response, "payload", json_string(payload_value));
+    log_serial_json("payload", response);
+    g_free(sanitized_payload);
     gboolean success = serial_send_json(data, response);
     json_decref(response);
     return success;
+}
+
+static gchar* sanitize_utf8(const char *value) {
+    if (!value) {
+        return g_strdup("");
+    }
+    if (g_utf8_validate(value, -1, NULL)) {
+        return g_strdup(value);
+    }
+    gchar *fixed = g_utf8_make_valid(value, -1);
+    if (!fixed) {
+        return g_strdup("");
+    }
+    return fixed;
+}
+
+static void log_serial_json(const char *context, json_t *message) {
+    if (!message) {
+        return;
+    }
+    char *debug = json_dumps(message, JSON_COMPACT);
+    if (debug) {
+        g_print("Serial TX [%s]: %s\n", context ? context : "?", debug);
+        free(debug);
+    }
 }
 
 static void wifi_network_reset(WifiNetwork *network) {
@@ -527,8 +565,12 @@ static gboolean collect_wifi_networks(json_t **result_array) {
     for (guint i = 0; i < networks->len; i++) {
         WifiNetwork *network = g_ptr_array_index(networks, i);
         json_t *entry = json_object();
-        json_object_set_new(entry, "SSID", json_string(network->ssid ? network->ssid : ""));
-        json_object_set_new(entry, "BSSID", json_string(network->bssid ? network->bssid : ""));
+        gchar *safe_ssid = sanitize_utf8(network->ssid);
+        gchar *safe_bssid = sanitize_utf8(network->bssid);
+        json_object_set_new(entry, "SSID", json_string(safe_ssid ? safe_ssid : ""));
+        json_object_set_new(entry, "BSSID", json_string(safe_bssid ? safe_bssid : ""));
+        g_free(safe_ssid);
+        g_free(safe_bssid);
         if (network->signal_dbm != G_MININT) {
             json_object_set_new(entry, "signal_dbm", json_integer(network->signal_dbm));
         }
