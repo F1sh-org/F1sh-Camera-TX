@@ -372,11 +372,7 @@ static gboolean serial_send_json(CustomData *data, json_t *message) {
 }
 
 static gboolean respond_with_status(CustomData *data, gint status_code) {
-    json_t *response = json_object();
-    json_object_set_new(response, "status", json_integer(status_code));
-    gboolean success = serial_send_json(data, response);
-    json_decref(response);
-    return success;
+    return respond_with_payload(data, status_code, "");
 }
 
 static gboolean respond_with_payload(CustomData *data, gint status_code, const char *payload) {
