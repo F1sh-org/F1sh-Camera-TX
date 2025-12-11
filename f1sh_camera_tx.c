@@ -2,16 +2,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <microhttpd.h>
 #include <jansson.h>
 #include <glob.h>
+#include <glib.h>
+#include <glib/gstdio.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
 
 #define HTTP_PORT 8888
-#define CONFIG_FILE_PATH "config.json"
+#define DEFAULT_CONFIG_FILENAME "config.json"
 
 // Default configuration
 #define DEFAULT_HOST "127.0.0.1"
@@ -49,6 +52,7 @@ typedef struct _CustomData {
     GMutex state_mutex;
     gboolean pipeline_is_restarting;
     gboolean should_terminate;
+    gchar *config_file_path;
 } CustomData;
 
 struct connection_info_struct {
@@ -63,6 +67,8 @@ static void init_config(AppConfig *config);
 static void free_config_members(AppConfig *config);
 static gboolean save_config_to_file(const AppConfig *config, const char *path);
 static gboolean load_config_from_file(AppConfig *config, const char *path);
+static gboolean ensure_directory_for_file(const char *path);
+static gchar* resolve_config_path(void);
 static void init_stats(StreamStats *stats);
 static void free_stats(StreamStats *stats);
 
@@ -120,6 +126,11 @@ static gboolean config_file_exists(const char *path) {
 }
 
 static gboolean save_config_to_file(const AppConfig *config, const char *path) {
+    if (!ensure_directory_for_file(path)) {
+        g_printerr("Cannot ensure directory for %s\n", path);
+        return FALSE;
+    }
+
     json_t *root = json_object();
     json_object_set_new(root, "host", json_string(config->host ? config->host : ""));
     json_object_set_new(root, "port", json_integer(config->port));
@@ -213,6 +224,42 @@ static gboolean load_config_from_file(AppConfig *config, const char *path) {
 
     json_decref(root);
     return TRUE;
+}
+
+static gboolean ensure_directory_for_file(const char *path) {
+    gboolean success = TRUE;
+    gchar *dir = g_path_get_dirname(path);
+    if (dir && dir[0] != '\0' && strcmp(dir, ".") != 0) {
+        if (g_mkdir_with_parents(dir, 0700) != 0 && errno != EEXIST) {
+            g_printerr("Failed to create configuration directory %s: %s\n", dir, g_strerror(errno));
+            success = FALSE;
+        }
+    }
+    g_free(dir);
+    return success;
+}
+
+static gchar* resolve_config_path(void) {
+    const gchar *env_path = g_getenv("F1SH_CONFIG_PATH");
+    if (env_path && env_path[0] != '\0') {
+        return g_strdup(env_path);
+    }
+
+    const gchar *xdg_config = g_get_user_config_dir();
+    if (xdg_config && xdg_config[0] != '\0') {
+        gchar *path = g_build_filename(xdg_config, "f1sh-camera-tx", DEFAULT_CONFIG_FILENAME, NULL);
+        if (path) {
+            return path;
+        }
+    }
+
+    const gchar *home_dir = g_get_home_dir();
+    if (home_dir && home_dir[0] != '\0') {
+        return g_build_filename(home_dir, ".f1sh-camera-tx", DEFAULT_CONFIG_FILENAME, NULL);
+    }
+
+    g_printerr("Falling back to relative %s for configuration; no home directory detected\n", DEFAULT_CONFIG_FILENAME);
+    return g_strdup(DEFAULT_CONFIG_FILENAME);
 }
 
 // Initialize statistics
@@ -676,8 +723,12 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     }
 
     if (config_modified) {
-        if (!save_config_to_file(&data->config, CONFIG_FILE_PATH)) {
-            g_printerr("Failed to persist configuration after update\n");
+        if (data->config_file_path) {
+            if (!save_config_to_file(&data->config, data->config_file_path)) {
+                g_printerr("Failed to persist configuration after update\n");
+            }
+        } else {
+            g_printerr("Configuration path unset; cannot persist update\n");
         }
     }
 
@@ -1001,19 +1052,34 @@ int main(int argc, char *argv[]) {
     memset(&data, 0, sizeof(data));
     init_config(&data.config);
 
-    if (config_file_exists(CONFIG_FILE_PATH)) {
-        if (load_config_from_file(&data.config, CONFIG_FILE_PATH)) {
-            g_print("Loaded configuration from %s\n", CONFIG_FILE_PATH);
+    data.config_file_path = resolve_config_path();
+    if (!data.config_file_path) {
+        g_printerr("Unable to resolve configuration path. Exiting.\n");
+        free_config_members(&data.config);
+        return -1;
+    }
+
+    if (!ensure_directory_for_file(data.config_file_path)) {
+        g_printerr("Configuration directory for %s is not writable. Exiting.\n", data.config_file_path);
+        free_config_members(&data.config);
+        g_free(data.config_file_path);
+        return -1;
+    }
+    g_print("Using configuration file %s\n", data.config_file_path);
+
+    if (config_file_exists(data.config_file_path)) {
+        if (load_config_from_file(&data.config, data.config_file_path)) {
+            g_print("Loaded configuration from %s\n", data.config_file_path);
         } else {
-            g_printerr("Failed to parse %s, rewriting defaults\n", CONFIG_FILE_PATH);
-            if (!save_config_to_file(&data.config, CONFIG_FILE_PATH)) {
+            g_printerr("Failed to parse %s, rewriting defaults\n", data.config_file_path);
+            if (!save_config_to_file(&data.config, data.config_file_path)) {
                 g_printerr("Also failed to write default configuration\n");
             }
         }
     } else {
-        g_print("Configuration file %s not found. Creating with defaults.\n", CONFIG_FILE_PATH);
-        if (!save_config_to_file(&data.config, CONFIG_FILE_PATH)) {
-            g_printerr("Failed to write default configuration to %s\n", CONFIG_FILE_PATH);
+        g_print("Configuration file %s not found. Creating with defaults.\n", data.config_file_path);
+        if (!save_config_to_file(&data.config, data.config_file_path)) {
+            g_printerr("Failed to write default configuration to %s\n", data.config_file_path);
         }
     }
 
@@ -1025,6 +1091,7 @@ int main(int argc, char *argv[]) {
         g_printerr("Failed to start initial pipeline. Exiting.\n");
         free_config_members(&data.config);
         g_mutex_clear(&data.state_mutex);
+        g_free(data.config_file_path);
         return -1;
     }
 
@@ -1034,6 +1101,10 @@ int main(int argc, char *argv[]) {
                                    MHD_OPTION_END);
     if (NULL == data.daemon) {
         g_printerr("Failed to start HTTP server.\n");
+        free_config_members(&data.config);
+        free_stats(&data.stats);
+        g_mutex_clear(&data.state_mutex);
+        g_free(data.config_file_path);
         return -1;
     }
 
@@ -1154,6 +1225,7 @@ int main(int argc, char *argv[]) {
     free_config_members(&data.config);
     free_stats(&data.stats);
     g_mutex_clear(&data.state_mutex);
+    g_free(data.config_file_path);
 
     return 0;
 }
