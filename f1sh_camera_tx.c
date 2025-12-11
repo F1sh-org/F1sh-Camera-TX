@@ -2,15 +2,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <microhttpd.h>
 #include <jansson.h>
 #include <glob.h>
+#include <glib.h>
+#include <glib/gstdio.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
 
 #define HTTP_PORT 8888
+#define DEFAULT_CONFIG_FILENAME "config.json"
 
 // Default configuration
 #define DEFAULT_HOST "127.0.0.1"
@@ -48,6 +52,7 @@ typedef struct _CustomData {
     GMutex state_mutex;
     gboolean pipeline_is_restarting;
     gboolean should_terminate;
+    gchar *config_file_path;
 } CustomData;
 
 struct connection_info_struct {
@@ -60,6 +65,10 @@ struct connection_info_struct {
 static gboolean build_and_run_pipeline(CustomData *data);
 static void init_config(AppConfig *config);
 static void free_config_members(AppConfig *config);
+static gboolean save_config_to_file(const AppConfig *config, const char *path);
+static gboolean load_config_from_file(AppConfig *config, const char *path);
+static gboolean ensure_directory_for_file(const char *path);
+static gchar* resolve_config_path(void);
 static void init_stats(StreamStats *stats);
 static void free_stats(StreamStats *stats);
 
@@ -105,6 +114,152 @@ void free_config_members(AppConfig *config) {
     g_free(config->host);
     g_free(config->camera_name);
     g_free(config->encoder_type);
+}
+
+static gboolean config_file_exists(const char *path) {
+    FILE *file = fopen(path, "r");
+    if (file) {
+        fclose(file);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean save_config_to_file(const AppConfig *config, const char *path) {
+    if (!ensure_directory_for_file(path)) {
+        g_printerr("Cannot ensure directory for %s\n", path);
+        return FALSE;
+    }
+
+    json_t *root = json_object();
+    json_object_set_new(root, "host", json_string(config->host ? config->host : ""));
+    json_object_set_new(root, "port", json_integer(config->port));
+    json_object_set_new(root, "camera", json_string(config->camera_name ? config->camera_name : ""));
+    json_object_set_new(root, "encoder", json_string(config->encoder_type ? config->encoder_type : ""));
+    json_object_set_new(root, "width", json_integer(config->width));
+    json_object_set_new(root, "height", json_integer(config->height));
+    json_object_set_new(root, "framerate", json_integer(config->framerate));
+
+    int dump_ret = json_dump_file(root, path, JSON_INDENT(2));
+    json_decref(root);
+
+    if (dump_ret != 0) {
+        g_printerr("Failed to save configuration to %s\n", path);
+        return FALSE;
+    }
+
+    g_print("Configuration persisted to %s\n", path);
+    return TRUE;
+}
+
+static gboolean load_config_from_file(AppConfig *config, const char *path) {
+    json_error_t error;
+    json_t *root = json_load_file(path, 0, &error);
+    if (!root) {
+        g_printerr("Unable to load configuration file %s: %s\n", path, error.text);
+        return FALSE;
+    }
+
+    json_t *value;
+    const char *str_val;
+
+    value = json_object_get(root, "host");
+    if (json_is_string(value)) {
+        str_val = json_string_value(value);
+        g_free(config->host);
+        config->host = g_strdup(str_val);
+    }
+
+    value = json_object_get(root, "port");
+    if (json_is_integer(value)) {
+        gint new_port = json_integer_value(value);
+        if (new_port > 0 && new_port <= 65535) {
+            config->port = new_port;
+        }
+    }
+
+    value = json_object_get(root, "camera");
+    if (json_is_string(value)) {
+        str_val = json_string_value(value);
+        g_free(config->camera_name);
+        config->camera_name = g_strdup(str_val);
+    }
+
+    value = json_object_get(root, "encoder");
+    if (json_is_string(value)) {
+        str_val = json_string_value(value);
+        g_free(config->encoder_type);
+        config->encoder_type = g_strdup(str_val);
+    }
+
+    value = json_object_get(root, "width");
+    if (json_is_integer(value)) {
+        gint new_width = json_integer_value(value);
+        if (new_width >= 320 && new_width <= 4608) {
+            config->width = new_width;
+        } else {
+            g_print("Ignoring invalid width %d from %s\n", new_width, path);
+        }
+    }
+
+    value = json_object_get(root, "height");
+    if (json_is_integer(value)) {
+        gint new_height = json_integer_value(value);
+        if (new_height >= 240 && new_height <= 2592) {
+            config->height = new_height;
+        } else {
+            g_print("Ignoring invalid height %d from %s\n", new_height, path);
+        }
+    }
+
+    value = json_object_get(root, "framerate");
+    if (json_is_integer(value)) {
+        gint new_framerate = json_integer_value(value);
+        if (new_framerate >= 1 && new_framerate <= 120) {
+            config->framerate = new_framerate;
+        } else {
+            g_print("Ignoring invalid framerate %d from %s\n", new_framerate, path);
+        }
+    }
+
+    json_decref(root);
+    return TRUE;
+}
+
+static gboolean ensure_directory_for_file(const char *path) {
+    gboolean success = TRUE;
+    gchar *dir = g_path_get_dirname(path);
+    if (dir && dir[0] != '\0' && strcmp(dir, ".") != 0) {
+        if (g_mkdir_with_parents(dir, 0700) != 0 && errno != EEXIST) {
+            g_printerr("Failed to create configuration directory %s: %s\n", dir, g_strerror(errno));
+            success = FALSE;
+        }
+    }
+    g_free(dir);
+    return success;
+}
+
+static gchar* resolve_config_path(void) {
+    const gchar *env_path = g_getenv("F1SH_CONFIG_PATH");
+    if (env_path && env_path[0] != '\0') {
+        return g_strdup(env_path);
+    }
+
+    const gchar *xdg_config = g_get_user_config_dir();
+    if (xdg_config && xdg_config[0] != '\0') {
+        gchar *path = g_build_filename(xdg_config, "f1sh-camera-tx", DEFAULT_CONFIG_FILENAME, NULL);
+        if (path) {
+            return path;
+        }
+    }
+
+    const gchar *home_dir = g_get_home_dir();
+    if (home_dir && home_dir[0] != '\0') {
+        return g_build_filename(home_dir, ".f1sh-camera-tx", DEFAULT_CONFIG_FILENAME, NULL);
+    }
+
+    g_printerr("Falling back to relative %s for configuration; no home directory detected\n", DEFAULT_CONFIG_FILENAME);
+    return g_strdup(DEFAULT_CONFIG_FILENAME);
 }
 
 // Initialize statistics
@@ -462,6 +617,7 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     const char *str_val;
     gboolean needs_pipeline_rebuild = FALSE;
     gboolean needs_udp_update = FALSE;
+    gboolean config_modified = FALSE;
 
     value = json_object_get(root, "host");
     if (json_is_string(value)) {
@@ -470,6 +626,7 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
             g_free(data->config.host);
             data->config.host = g_strdup(str_val);
             needs_udp_update = TRUE;
+            config_modified = TRUE;
         }
     }
     
@@ -479,6 +636,7 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         if (data->config.port != new_port) {
             data->config.port = new_port;
             needs_udp_update = TRUE;
+            config_modified = TRUE;
         }
     }
     
@@ -489,6 +647,7 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
             g_free(data->config.camera_name);
             data->config.camera_name = g_strdup(str_val);
             needs_pipeline_rebuild = TRUE;
+            config_modified = TRUE;
         }
     }
     
@@ -499,6 +658,7 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
             g_free(data->config.encoder_type);
             data->config.encoder_type = g_strdup(str_val);
             needs_pipeline_rebuild = TRUE;
+            config_modified = TRUE;
         }
     }
     
@@ -508,6 +668,7 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         if (new_width >= 320 && new_width <= 4608 && new_width != data->config.width) {
             data->config.width = new_width;
             needs_pipeline_rebuild = TRUE;
+            config_modified = TRUE;
         } else if (new_width < 320 || new_width > 4608) {
             g_print("Warning: Invalid width %d, keeping current value %d\n", new_width, data->config.width);
         }
@@ -519,6 +680,7 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         if (new_height >= 240 && new_height <= 2592 && new_height != data->config.height) {
             data->config.height = new_height;
             needs_pipeline_rebuild = TRUE;
+            config_modified = TRUE;
         } else if (new_height < 240 || new_height > 2592) {
             g_print("Warning: Invalid height %d, keeping current value %d\n", new_height, data->config.height);
         }
@@ -530,6 +692,7 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
         if (new_framerate >= 1 && new_framerate <= 120 && new_framerate != data->config.framerate) {
             data->config.framerate = new_framerate;
             needs_pipeline_rebuild = TRUE;
+            config_modified = TRUE;
         } else if (new_framerate < 1 || new_framerate > 120) {
             g_print("Warning: Invalid framerate %d, keeping current value %d\n", new_framerate, data->config.framerate);
         }
@@ -557,6 +720,16 @@ static enum MHD_Result process_config_update(struct connection_info_struct *con_
     } else {
         g_print("Configuration updated (no changes required): host=%s, port=%d\n", 
                 data->config.host, data->config.port);
+    }
+
+    if (config_modified) {
+        if (data->config_file_path) {
+            if (!save_config_to_file(&data->config, data->config_file_path)) {
+                g_printerr("Failed to persist configuration after update\n");
+            }
+        } else {
+            g_printerr("Configuration path unset; cannot persist update\n");
+        }
     }
 
     g_mutex_unlock(&data->state_mutex);
@@ -878,6 +1051,38 @@ int main(int argc, char *argv[]) {
 
     memset(&data, 0, sizeof(data));
     init_config(&data.config);
+
+    data.config_file_path = resolve_config_path();
+    if (!data.config_file_path) {
+        g_printerr("Unable to resolve configuration path. Exiting.\n");
+        free_config_members(&data.config);
+        return -1;
+    }
+
+    if (!ensure_directory_for_file(data.config_file_path)) {
+        g_printerr("Configuration directory for %s is not writable. Exiting.\n", data.config_file_path);
+        free_config_members(&data.config);
+        g_free(data.config_file_path);
+        return -1;
+    }
+    g_print("Using configuration file %s\n", data.config_file_path);
+
+    if (config_file_exists(data.config_file_path)) {
+        if (load_config_from_file(&data.config, data.config_file_path)) {
+            g_print("Loaded configuration from %s\n", data.config_file_path);
+        } else {
+            g_printerr("Failed to parse %s, rewriting defaults\n", data.config_file_path);
+            if (!save_config_to_file(&data.config, data.config_file_path)) {
+                g_printerr("Also failed to write default configuration\n");
+            }
+        }
+    } else {
+        g_print("Configuration file %s not found. Creating with defaults.\n", data.config_file_path);
+        if (!save_config_to_file(&data.config, data.config_file_path)) {
+            g_printerr("Failed to write default configuration to %s\n", data.config_file_path);
+        }
+    }
+
     init_stats(&data.stats);
     g_mutex_init(&data.state_mutex);
     data.should_terminate = FALSE;
@@ -886,6 +1091,7 @@ int main(int argc, char *argv[]) {
         g_printerr("Failed to start initial pipeline. Exiting.\n");
         free_config_members(&data.config);
         g_mutex_clear(&data.state_mutex);
+        g_free(data.config_file_path);
         return -1;
     }
 
@@ -895,6 +1101,10 @@ int main(int argc, char *argv[]) {
                                    MHD_OPTION_END);
     if (NULL == data.daemon) {
         g_printerr("Failed to start HTTP server.\n");
+        free_config_members(&data.config);
+        free_stats(&data.stats);
+        g_mutex_clear(&data.state_mutex);
+        g_free(data.config_file_path);
         return -1;
     }
 
@@ -1015,6 +1225,7 @@ int main(int argc, char *argv[]) {
     free_config_members(&data.config);
     free_stats(&data.stats);
     g_mutex_clear(&data.state_mutex);
+    g_free(data.config_file_path);
 
     return 0;
 }
