@@ -372,7 +372,11 @@ static gboolean serial_send_json(CustomData *data, json_t *message) {
     if (serial->fd >= 0) {
         if (serial_write_all(serial, json_str, payload_len) &&
             serial_write_all(serial, "\n", 1)) {
-            success = TRUE;
+            if (tcdrain(serial->fd) == 0) {
+                success = TRUE;
+            } else {
+                g_printerr("Serial: tcdrain failed: %s\n", g_strerror(errno));
+            }
         }
     }
     g_mutex_unlock(&serial->write_mutex);
@@ -598,7 +602,12 @@ static void handle_serial_message(CustomData *data, const char *payload, size_t 
     json_error_t error;
     json_t *root = json_loadb(payload, length, JSON_DECODE_ANY, &error);
     if (!root) {
-        g_printerr("Serial: JSON parse error near line %d: %s\n", error.line, error.text);
+        gchar preview[64];
+        size_t copy_len = length < sizeof(preview) - 1 ? length : sizeof(preview) - 1;
+        memcpy(preview, payload, copy_len);
+        preview[copy_len] = '\0';
+        g_printerr("Serial: JSON parse error near line %d: %s (payload preview: %s)\n",
+                   error.line, error.text, preview);
         return;
     }
 
