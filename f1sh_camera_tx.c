@@ -23,7 +23,9 @@
 
 #define HTTP_PORT 8888
 #define DEFAULT_SERIAL_DEVICE "/dev/ttyGS0"
+#define DEFAULT_WIFI_INTERFACE "wlan0"
 #define DEFAULT_CONFIG_FILENAME "config.json"
+#define SERIAL_PARTIAL_TIMEOUT_USEC (300 * 1000) // 300ms
 
 // Default configuration
 #define DEFAULT_HOST "127.0.0.1"
@@ -59,6 +61,12 @@ typedef struct {
     gint running;
     gchar *device_path;
 } SerialContext;
+
+typedef struct {
+    gchar *ssid;
+    gchar *bssid;
+    gint signal_dbm;
+} WifiNetwork;
 
 typedef struct _CustomData {
     GstElement *pipeline;
@@ -97,6 +105,12 @@ static gpointer serial_reader_thread(gpointer user_data);
 static void handle_serial_message(CustomData *data, const char *payload, size_t length);
 static gboolean process_serial_request(CustomData *data, json_t *message);
 static gboolean respond_with_status(CustomData *data, gint status_code);
+static gboolean respond_with_payload(CustomData *data, gint status_code, const char *payload);
+static gboolean handle_wifi_scan_request(CustomData *data);
+static gboolean collect_wifi_networks(json_t **result_array);
+static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length);
+static gchar* sanitize_utf8(const gchar *value);
+static void log_serial_json(const char *context, json_t *message);
 
 // Probe callback to monitor data flow
 static GstPadProbeReturn
@@ -324,6 +338,23 @@ static gboolean configure_serial_port(int fd) {
     return TRUE;
 }
 
+static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length) {
+    size_t total_written = 0;
+    while (total_written < length) {
+        ssize_t written = write(serial->fd, buffer + total_written, length - total_written);
+        if (written > 0) {
+            total_written += (size_t)written;
+            continue;
+        }
+        if (written < 0 && (errno == EAGAIN || errno == EINTR)) {
+            g_usleep(1000);
+            continue;
+        }
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static gboolean serial_send_json(CustomData *data, json_t *message) {
     SerialContext *serial = &data->serial;
     if (serial->fd < 0 || !g_atomic_int_get(&serial->running)) {
@@ -342,11 +373,12 @@ static gboolean serial_send_json(CustomData *data, json_t *message) {
 
     g_mutex_lock(&serial->write_mutex);
     if (serial->fd >= 0) {
-        ssize_t written = write(serial->fd, json_str, payload_len);
-        if (written == (ssize_t)payload_len) {
-            ssize_t newline_written = write(serial->fd, "\n", 1);
-            if (newline_written == 1) {
+        if (serial_write_all(serial, json_str, payload_len) &&
+            serial_write_all(serial, "\n", 1)) {
+            if (tcdrain(serial->fd) == 0) {
                 success = TRUE;
+            } else {
+                g_printerr("Serial: tcdrain failed: %s\n", g_strerror(errno));
             }
         }
     }
@@ -364,8 +396,208 @@ static gboolean serial_send_json(CustomData *data, json_t *message) {
 static gboolean respond_with_status(CustomData *data, gint status_code) {
     json_t *response = json_object();
     json_object_set_new(response, "status", json_integer(status_code));
+    log_serial_json("status", response);
     gboolean success = serial_send_json(data, response);
     json_decref(response);
+    return success;
+}
+
+static gboolean respond_with_payload(CustomData *data, gint status_code, const char *payload) {
+    json_t *response = json_object();
+    json_object_set_new(response, "status", json_integer(status_code));
+    const char *payload_value = payload ? payload : "";
+    gchar *sanitized_payload = NULL;
+    if (!g_utf8_validate(payload_value, -1, NULL)) {
+        sanitized_payload = sanitize_utf8(payload_value);
+        payload_value = sanitized_payload ? sanitized_payload : "";
+        g_printerr("Serial: payload contained invalid UTF-8, sanitized before sending\n");
+    }
+
+    json_object_set_new(response, "payload", json_string(payload_value));
+    log_serial_json("payload", response);
+    g_free(sanitized_payload);
+    gboolean success = serial_send_json(data, response);
+    json_decref(response);
+    return success;
+}
+
+static gchar* sanitize_utf8(const char *value) {
+    if (!value) {
+        return g_strdup("");
+    }
+    if (g_utf8_validate(value, -1, NULL)) {
+        return g_strdup(value);
+    }
+    gchar *fixed = g_utf8_make_valid(value, -1);
+    if (!fixed) {
+        return g_strdup("");
+    }
+    return fixed;
+}
+
+static void log_serial_json(const char *context, json_t *message) {
+    if (!message) {
+        return;
+    }
+    char *debug = json_dumps(message, JSON_COMPACT);
+    if (debug) {
+        g_print("Serial TX [%s]: %s\n", context ? context : "?", debug);
+        free(debug);
+    }
+}
+
+static void wifi_network_reset(WifiNetwork *network) {
+    if (!network) {
+        return;
+    }
+    if (network->ssid) {
+        g_free(network->ssid);
+        network->ssid = NULL;
+    }
+    if (network->bssid) {
+        g_free(network->bssid);
+        network->bssid = NULL;
+    }
+    network->signal_dbm = G_MININT;
+}
+
+static void wifi_network_finalize_current(GPtrArray *array, WifiNetwork *current) {
+    if (!array || !current || !current->bssid) {
+        return;
+    }
+
+    WifiNetwork *entry = g_new0(WifiNetwork, 1);
+    entry->ssid = current->ssid ? g_strdup(current->ssid) : g_strdup("");
+    entry->bssid = g_strdup(current->bssid);
+    entry->signal_dbm = current->signal_dbm;
+    g_ptr_array_add(array, entry);
+}
+
+static void wifi_network_free(WifiNetwork *network) {
+    if (!network) {
+        return;
+    }
+    g_free(network->ssid);
+    g_free(network->bssid);
+    g_free(network);
+}
+
+static gint wifi_network_compare(gconstpointer a, gconstpointer b) {
+    const WifiNetwork *net_a = a;
+    const WifiNetwork *net_b = b;
+
+    if (net_a->signal_dbm == net_b->signal_dbm) {
+        return 0;
+    }
+
+    return (net_a->signal_dbm > net_b->signal_dbm) ? -1 : 1;
+}
+
+static gboolean collect_wifi_networks(json_t **result_array) {
+    if (!result_array) {
+        return FALSE;
+    }
+
+    const gchar *iface = g_getenv("F1SH_WIFI_INTERFACE");
+    if (!iface || iface[0] == '\0') {
+        iface = DEFAULT_WIFI_INTERFACE;
+    }
+
+    gchar *command = g_strdup_printf("iwlist %s scan 2>/dev/null", iface);
+    if (!command) {
+        return FALSE;
+    }
+
+    FILE *scan_pipe = popen(command, "r");
+    if (!scan_pipe) {
+        g_printerr("WiFi: failed to execute '%s': %s\n", command, g_strerror(errno));
+        g_free(command);
+        return FALSE;
+    }
+
+    g_print("WiFi: scanning interface %s for available networks\n", iface);
+
+    GPtrArray *networks = g_ptr_array_new_with_free_func((GDestroyNotify)wifi_network_free);
+    WifiNetwork current = {0};
+    current.signal_dbm = G_MININT;
+
+    char line[512];
+    while (fgets(line, sizeof(line), scan_pipe)) {
+        gchar *trimmed = g_strstrip(line);
+
+        if (g_str_has_prefix(trimmed, "Cell ")) {
+            wifi_network_finalize_current(networks, &current);
+            wifi_network_reset(&current);
+
+            gchar bssid_buf[32] = {0};
+            if (sscanf(trimmed, "Cell %*d - Address: %31s", bssid_buf) == 1) {
+                current.bssid = g_strdup(bssid_buf);
+            }
+        } else if (g_str_has_prefix(trimmed, "ESSID:\"")) {
+            gchar *start = strchr(trimmed, '\"');
+            gchar *end = start ? strchr(start + 1, '\"') : NULL;
+            if (start && end && end > start) {
+                g_free(current.ssid);
+                current.ssid = g_strndup(start + 1, (gsize)(end - start - 1));
+            }
+        } else if (strstr(trimmed, "Signal level=")) {
+            gchar *sig_ptr = strstr(trimmed, "Signal level=");
+            sig_ptr += strlen("Signal level=");
+            int signal = (int)strtol(sig_ptr, NULL, 10);
+            current.signal_dbm = signal;
+        }
+    }
+
+    wifi_network_finalize_current(networks, &current);
+    wifi_network_reset(&current);
+
+    int scan_status = pclose(scan_pipe);
+    if (scan_status == -1) {
+        g_printerr("WiFi: failed to close scan command pipe\n");
+    }
+    g_free(command);
+
+    if (networks->len > 1) {
+        g_ptr_array_sort(networks, wifi_network_compare);
+    }
+
+    json_t *array = json_array();
+    for (guint i = 0; i < networks->len; i++) {
+        WifiNetwork *network = g_ptr_array_index(networks, i);
+        json_t *entry = json_object();
+        gchar *safe_ssid = sanitize_utf8(network->ssid);
+        gchar *safe_bssid = sanitize_utf8(network->bssid);
+        json_object_set_new(entry, "SSID", json_string(safe_ssid ? safe_ssid : ""));
+        json_object_set_new(entry, "BSSID", json_string(safe_bssid ? safe_bssid : ""));
+        g_free(safe_ssid);
+        g_free(safe_bssid);
+        if (network->signal_dbm != G_MININT) {
+            json_object_set_new(entry, "signal_dbm", json_integer(network->signal_dbm));
+        }
+        json_array_append_new(array, entry);
+    }
+
+    g_ptr_array_free(networks, TRUE);
+    *result_array = array;
+    return TRUE;
+}
+
+static gboolean handle_wifi_scan_request(CustomData *data) {
+    json_t *wifi_networks = NULL;
+    if (!collect_wifi_networks(&wifi_networks)) {
+        g_printerr("WiFi: scan failed, responding with empty result\n");
+        return respond_with_payload(data, 4, "[]");
+    }
+
+    char *payload_str = json_dumps(wifi_networks, JSON_COMPACT);
+    json_decref(wifi_networks);
+    if (!payload_str) {
+        g_printerr("WiFi: failed to serialize scan results\n");
+        return respond_with_payload(data, 4, "[]");
+    }
+
+    gboolean success = respond_with_payload(data, 4, payload_str);
+    free(payload_str);
     return success;
 }
 
@@ -388,6 +620,14 @@ static gboolean process_serial_request(CustomData *data, json_t *message) {
             // No payload required for this status; simple echo response.
             return respond_with_status(data, 1);
         }
+        case 4: {
+            g_print("Serial: received status 4 Wi-Fi scan request\n");
+            if (!handle_wifi_scan_request(data)) {
+                g_printerr("Serial: failed to respond to Wi-Fi scan request\n");
+                return FALSE;
+            }
+            return TRUE;
+        }
         default: {
             json_t *payload = json_object_get(message, "payload");
             g_print("Serial: unhandled status code %d\n", status_code);
@@ -405,7 +645,12 @@ static void handle_serial_message(CustomData *data, const char *payload, size_t 
     json_error_t error;
     json_t *root = json_loadb(payload, length, JSON_DECODE_ANY, &error);
     if (!root) {
-        g_printerr("Serial: JSON parse error near line %d: %s\n", error.line, error.text);
+        gchar preview[64];
+        size_t copy_len = length < sizeof(preview) - 1 ? length : sizeof(preview) - 1;
+        memcpy(preview, payload, copy_len);
+        preview[copy_len] = '\0';
+        g_printerr("Serial: JSON parse error near line %d: %s (payload preview: %s)\n",
+                   error.line, error.text, preview);
         return;
     }
 
@@ -426,8 +671,18 @@ static gpointer serial_reader_thread(gpointer user_data) {
     CustomData *data = (CustomData *)user_data;
     SerialContext *serial = &data->serial;
     GString *buffer = g_string_new(NULL);
+    gint64 partial_start_time = 0;
 
     while (g_atomic_int_get(&serial->running)) {
+        if (buffer->len > 0 && partial_start_time > 0) {
+            gint64 now = g_get_monotonic_time();
+            if (now - partial_start_time > SERIAL_PARTIAL_TIMEOUT_USEC) {
+                g_printerr("Serial: dropping stale partial request (%zu bytes)\n", buffer->len);
+                g_string_set_size(buffer, 0);
+                partial_start_time = 0;
+            }
+        }
+
         struct pollfd pfd = {
             .fd = serial->fd,
             .events = POLLIN,
@@ -439,7 +694,11 @@ static gpointer serial_reader_thread(gpointer user_data) {
             char chunk[256];
             ssize_t bytes_read = read(serial->fd, chunk, sizeof(chunk));
             if (bytes_read > 0) {
+                gboolean buffer_was_empty = (buffer->len == 0);
                 g_string_append_len(buffer, chunk, (gssize)bytes_read);
+                if (buffer_was_empty && buffer->len > 0) {
+                    partial_start_time = g_get_monotonic_time();
+                }
 
                 while (TRUE) {
                     gchar *newline = memchr(buffer->str, '\n', buffer->len);
@@ -458,11 +717,17 @@ static gpointer serial_reader_thread(gpointer user_data) {
                     }
 
                     g_string_erase(buffer, 0, newline_pos + 1);
+                    if (buffer->len == 0) {
+                        partial_start_time = 0;
+                    }
                 }
 
                 if (buffer->len > 8192) {
                     g_printerr("Serial: dropping oversized partial message (%zu bytes)\n", buffer->len);
                     g_string_set_size(buffer, 0);
+                    partial_start_time = 0;
+                } else if (buffer->len > 0 && partial_start_time == 0) {
+                    partial_start_time = g_get_monotonic_time();
                 }
             } else if (bytes_read < 0 && errno != EAGAIN && errno != EINTR) {
                 g_printerr("Serial: read error: %s\n", g_strerror(errno));
