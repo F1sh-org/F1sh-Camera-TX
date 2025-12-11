@@ -25,6 +25,7 @@
 #define DEFAULT_SERIAL_DEVICE "/dev/ttyGS0"
 #define DEFAULT_WIFI_INTERFACE "wlan0"
 #define DEFAULT_CONFIG_FILENAME "config.json"
+#define SERIAL_PARTIAL_TIMEOUT_USEC (300 * 1000) // 300ms
 
 // Default configuration
 #define DEFAULT_HOST "127.0.0.1"
@@ -628,8 +629,18 @@ static gpointer serial_reader_thread(gpointer user_data) {
     CustomData *data = (CustomData *)user_data;
     SerialContext *serial = &data->serial;
     GString *buffer = g_string_new(NULL);
+    gint64 partial_start_time = 0;
 
     while (g_atomic_int_get(&serial->running)) {
+        if (buffer->len > 0 && partial_start_time > 0) {
+            gint64 now = g_get_monotonic_time();
+            if (now - partial_start_time > SERIAL_PARTIAL_TIMEOUT_USEC) {
+                g_printerr("Serial: dropping stale partial request (%zu bytes)\n", buffer->len);
+                g_string_set_size(buffer, 0);
+                partial_start_time = 0;
+            }
+        }
+
         struct pollfd pfd = {
             .fd = serial->fd,
             .events = POLLIN,
@@ -641,7 +652,11 @@ static gpointer serial_reader_thread(gpointer user_data) {
             char chunk[256];
             ssize_t bytes_read = read(serial->fd, chunk, sizeof(chunk));
             if (bytes_read > 0) {
+                gboolean buffer_was_empty = (buffer->len == 0);
                 g_string_append_len(buffer, chunk, (gssize)bytes_read);
+                if (buffer_was_empty && buffer->len > 0) {
+                    partial_start_time = g_get_monotonic_time();
+                }
 
                 while (TRUE) {
                     gchar *newline = memchr(buffer->str, '\n', buffer->len);
@@ -660,11 +675,17 @@ static gpointer serial_reader_thread(gpointer user_data) {
                     }
 
                     g_string_erase(buffer, 0, newline_pos + 1);
+                    if (buffer->len == 0) {
+                        partial_start_time = 0;
+                    }
                 }
 
                 if (buffer->len > 8192) {
                     g_printerr("Serial: dropping oversized partial message (%zu bytes)\n", buffer->len);
                     g_string_set_size(buffer, 0);
+                    partial_start_time = 0;
+                } else if (buffer->len > 0 && partial_start_time == 0) {
+                    partial_start_time = g_get_monotonic_time();
                 }
             } else if (bytes_read < 0 && errno != EAGAIN && errno != EINTR) {
                 g_printerr("Serial: read error: %s\n", g_strerror(errno));
