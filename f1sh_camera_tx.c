@@ -107,6 +107,7 @@ static gboolean respond_with_status(CustomData *data, gint status_code);
 static gboolean respond_with_payload(CustomData *data, gint status_code, const char *payload);
 static gboolean handle_wifi_scan_request(CustomData *data);
 static gboolean collect_wifi_networks(json_t **result_array);
+static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length);
 
 // Probe callback to monitor data flow
 static GstPadProbeReturn
@@ -334,6 +335,23 @@ static gboolean configure_serial_port(int fd) {
     return TRUE;
 }
 
+static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length) {
+    size_t total_written = 0;
+    while (total_written < length) {
+        ssize_t written = write(serial->fd, buffer + total_written, length - total_written);
+        if (written > 0) {
+            total_written += (size_t)written;
+            continue;
+        }
+        if (written < 0 && (errno == EAGAIN || errno == EINTR)) {
+            g_usleep(1000);
+            continue;
+        }
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static gboolean serial_send_json(CustomData *data, json_t *message) {
     SerialContext *serial = &data->serial;
     if (serial->fd < 0 || !g_atomic_int_get(&serial->running)) {
@@ -352,12 +370,9 @@ static gboolean serial_send_json(CustomData *data, json_t *message) {
 
     g_mutex_lock(&serial->write_mutex);
     if (serial->fd >= 0) {
-        ssize_t written = write(serial->fd, json_str, payload_len);
-        if (written == (ssize_t)payload_len) {
-            ssize_t newline_written = write(serial->fd, "\n", 1);
-            if (newline_written == 1) {
-                success = TRUE;
-            }
+        if (serial_write_all(serial, json_str, payload_len) &&
+            serial_write_all(serial, "\n", 1)) {
+            success = TRUE;
         }
     }
     g_mutex_unlock(&serial->write_mutex);
@@ -372,7 +387,11 @@ static gboolean serial_send_json(CustomData *data, json_t *message) {
 }
 
 static gboolean respond_with_status(CustomData *data, gint status_code) {
-    return respond_with_payload(data, status_code, "");
+    json_t *response = json_object();
+    json_object_set_new(response, "status", json_integer(status_code));
+    gboolean success = serial_send_json(data, response);
+    json_decref(response);
+    return success;
 }
 
 static gboolean respond_with_payload(CustomData *data, gint status_code, const char *payload) {
