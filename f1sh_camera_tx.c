@@ -107,6 +107,7 @@ static gboolean process_serial_request(CustomData *data, json_t *message);
 static gboolean respond_with_status(CustomData *data, gint status_code);
 static gboolean respond_with_payload(CustomData *data, gint status_code, const char *payload);
 static gboolean handle_wifi_scan_request(CustomData *data);
+static gboolean handle_config_request(CustomData *data);
 static gboolean collect_wifi_networks(json_t **result_array);
 static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length);
 static gchar* sanitize_utf8(const gchar *value);
@@ -601,6 +602,32 @@ static gboolean handle_wifi_scan_request(CustomData *data) {
     return success;
 }
 
+static gboolean handle_config_request(CustomData *data) {
+    if (!data) {
+        return FALSE;
+    }
+
+    g_mutex_lock(&data->state_mutex);
+    json_t *cfg = json_object();
+    json_object_set_new(cfg, "host", json_string(data->config.host ? data->config.host : ""));
+    json_object_set_new(cfg, "port", json_integer(data->config.port));
+    json_object_set_new(cfg, "width", json_integer(data->config.width));
+    json_object_set_new(cfg, "height", json_integer(data->config.height));
+    json_object_set_new(cfg, "framerate", json_integer(data->config.framerate));
+    g_mutex_unlock(&data->state_mutex);
+
+    char *payload_str = json_dumps(cfg, JSON_COMPACT);
+    json_decref(cfg);
+    if (!payload_str) {
+        g_printerr("Serial: failed to serialize config payload\n");
+        return respond_with_payload(data, 5, "{}");
+    }
+
+    gboolean success = respond_with_payload(data, 5, payload_str);
+    free(payload_str);
+    return success;
+}
+
 static gboolean process_serial_request(CustomData *data, json_t *message) {
     json_t *status_value = json_object_get(message, "status");
     if (!json_is_integer(status_value)) {
@@ -619,6 +646,14 @@ static gboolean process_serial_request(CustomData *data, json_t *message) {
             g_print("Serial: received status 1 request\n");
             // No payload required for this status; simple echo response.
             return respond_with_status(data, 1);
+        }
+        case 5: {
+            g_print("Serial: received status 5 configuration request\n");
+            if (!handle_config_request(data)) {
+                g_printerr("Serial: failed to respond to configuration request\n");
+                return FALSE;
+            }
+            return TRUE;
         }
         case 21: {
             g_print("Serial: received status %d Wi-Fi scan request\n", status_code);
