@@ -108,10 +108,21 @@ static gboolean respond_with_status(CustomData *data, gint status_code);
 static gboolean respond_with_payload(CustomData *data, gint status_code, const char *payload);
 static gboolean handle_wifi_scan_request(CustomData *data);
 static gboolean handle_config_request(CustomData *data);
+static gboolean handle_wifi_connect_request(CustomData *data, json_t *payload);
 static gboolean collect_wifi_networks(json_t **result_array);
 static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length);
 static gchar* sanitize_utf8(const gchar *value);
 static void log_serial_json(const char *context, json_t *message);
+static const gchar* resolve_wifi_interface_name(void);
+static gboolean validate_bssid_format(const char *bssid);
+static gboolean lookup_ssid_for_bssid(const char *target_bssid, gchar **ssid_out);
+static gchar* quote_wpa_cli_string(const char *input);
+static gboolean is_hex_string(const char *value);
+static gchar* format_psk_value(const char *passphrase);
+static gboolean run_command_sync(gchar * const argv[], gchar **stdout_out);
+static gboolean get_interface_ipv4(const char *iface, gchar **ip_out);
+static gboolean connect_to_wifi_bssid(const char *iface, const char *bssid, const char *ssid,
+                                      const char *passphrase, gchar **ip_address_out);
 
 // Probe callback to monitor data flow
 static GstPadProbeReturn
@@ -494,15 +505,20 @@ static gint wifi_network_compare(gconstpointer a, gconstpointer b) {
     return (net_a->signal_dbm > net_b->signal_dbm) ? -1 : 1;
 }
 
+static const gchar* resolve_wifi_interface_name(void) {
+    const gchar *iface = g_getenv("F1SH_WIFI_INTERFACE");
+    if (iface && iface[0] != '\0') {
+        return iface;
+    }
+    return DEFAULT_WIFI_INTERFACE;
+}
+
 static gboolean collect_wifi_networks(json_t **result_array) {
     if (!result_array) {
         return FALSE;
     }
 
-    const gchar *iface = g_getenv("F1SH_WIFI_INTERFACE");
-    if (!iface || iface[0] == '\0') {
-        iface = DEFAULT_WIFI_INTERFACE;
-    }
+    const gchar *iface = resolve_wifi_interface_name();
 
     gchar *command = g_strdup_printf("iwlist %s scan 2>/dev/null", iface);
     if (!command) {
@@ -583,6 +599,344 @@ static gboolean collect_wifi_networks(json_t **result_array) {
     return TRUE;
 }
 
+static gboolean validate_bssid_format(const char *bssid) {
+    if (!bssid) {
+        return FALSE;
+    }
+    size_t len = strlen(bssid);
+    if (len != 17) {
+        return FALSE;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if ((i + 1) % 3 == 0) {
+            if (bssid[i] != ':') {
+                return FALSE;
+            }
+            continue;
+        }
+        if (!g_ascii_isxdigit(bssid[i])) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static gboolean lookup_ssid_for_bssid(const char *target_bssid, gchar **ssid_out) {
+    if (!target_bssid || !ssid_out) {
+        return FALSE;
+    }
+
+    *ssid_out = NULL;
+    json_t *wifi_networks = NULL;
+    if (!collect_wifi_networks(&wifi_networks)) {
+        return FALSE;
+    }
+
+    gboolean found = FALSE;
+    size_t count = json_array_size(wifi_networks);
+    for (size_t i = 0; i < count; i++) {
+        json_t *entry = json_array_get(wifi_networks, i);
+        const char *bssid = json_string_value(json_object_get(entry, "BSSID"));
+        if (!bssid) {
+            continue;
+        }
+        if (g_ascii_strcasecmp(bssid, target_bssid) == 0) {
+            const char *ssid = json_string_value(json_object_get(entry, "SSID"));
+            *ssid_out = g_strdup(ssid ? ssid : "");
+            found = TRUE;
+            break;
+        }
+    }
+
+    json_decref(wifi_networks);
+    return found;
+}
+
+static gchar* quote_wpa_cli_string(const char *input) {
+    if (!input) {
+        input = "";
+    }
+
+    GString *builder = g_string_new("\"");
+    for (const char *cursor = input; *cursor; cursor++) {
+        if (*cursor == '\\' || *cursor == '"') {
+            g_string_append_c(builder, '\\');
+        }
+        g_string_append_c(builder, *cursor);
+    }
+    g_string_append_c(builder, '"');
+    return g_string_free(builder, FALSE);
+}
+
+static gboolean is_hex_string(const char *value) {
+    if (!value) {
+        return FALSE;
+    }
+    for (const char *cursor = value; *cursor; cursor++) {
+        if (!g_ascii_isxdigit(*cursor)) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static gchar* format_psk_value(const char *passphrase) {
+    if (!passphrase) {
+        return quote_wpa_cli_string("");
+    }
+
+    size_t len = strlen(passphrase);
+    if (len == 64 && is_hex_string(passphrase)) {
+        return g_strdup(passphrase);
+    }
+    if (len < 8 || len > 63) {
+        return NULL;
+    }
+    return quote_wpa_cli_string(passphrase);
+}
+
+static gboolean run_command_sync(gchar * const argv[], gchar **stdout_out) {
+    if (!argv || !argv[0]) {
+        return FALSE;
+    }
+
+    gchar *std_out = NULL;
+    gchar *std_err = NULL;
+    gint exit_status = 0;
+    GError *error = NULL;
+
+    gboolean spawned = g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+                                    NULL, NULL, stdout_out ? &std_out : NULL,
+                                    &std_err, &exit_status, &error);
+    if (!spawned) {
+        g_printerr("Command %s failed to launch: %s\n", argv[0], error ? error->message : "unknown");
+        if (error) {
+            g_error_free(error);
+        }
+        g_free(std_err);
+        g_free(std_out);
+        return FALSE;
+    }
+
+    if (exit_status != 0) {
+        g_printerr("Command %s exited with %d%s%s\n", argv[0], exit_status,
+                   std_err ? ": " : "", std_err ? std_err : "");
+        g_free(std_err);
+        g_free(std_out);
+        return FALSE;
+    }
+
+    if (stdout_out) {
+        *stdout_out = std_out ? std_out : g_strdup("");
+    } else if (std_out) {
+        g_free(std_out);
+    }
+
+    g_free(std_err);
+    return TRUE;
+}
+
+static gboolean get_interface_ipv4(const char *iface, gchar **ip_out) {
+    if (!iface || !ip_out) {
+        return FALSE;
+    }
+
+    *ip_out = NULL;
+    gchar *stdout_str = NULL;
+    gchar * const args[] = {"ip", "-4", "addr", "show", "dev", (gchar *)iface, NULL};
+    if (!run_command_sync(args, &stdout_str)) {
+        return FALSE;
+    }
+
+    const char *needle = "inet ";
+    gchar *cursor = stdout_str;
+    while ((cursor = g_strstr_len(cursor, -1, needle)) != NULL) {
+        cursor += strlen(needle);
+        while (*cursor == ' ') {
+            cursor++;
+        }
+        char ip_buffer[64] = {0};
+        size_t idx = 0;
+        while (cursor[idx] && !g_ascii_isspace(cursor[idx]) && idx < sizeof(ip_buffer) - 1) {
+            ip_buffer[idx] = cursor[idx];
+            idx++;
+        }
+        ip_buffer[idx] = '\0';
+        if (idx > 0) {
+            char *slash = strchr(ip_buffer, '/');
+            if (slash) {
+                *slash = '\0';
+            }
+            *ip_out = g_strdup(ip_buffer);
+            g_free(stdout_str);
+            return TRUE;
+        }
+    }
+
+    g_free(stdout_str);
+    return FALSE;
+}
+
+static gboolean connect_to_wifi_bssid(const char *iface, const char *bssid, const char *ssid,
+                                      const char *passphrase, gchar **ip_address_out) {
+    if (!iface || !bssid || !ssid || !passphrase || !ip_address_out) {
+        return FALSE;
+    }
+
+    *ip_address_out = NULL;
+    gboolean success = FALSE;
+    gchar *netid_stdout = NULL;
+    gchar *netid_str = NULL;
+    gchar *ssid_value = NULL;
+    gchar *psk_value = NULL;
+    gchar *bssid_lower = NULL;
+
+    gchar * const add_args[] = {"wpa_cli", "-i", (gchar *)iface, "add_network", NULL};
+    if (!run_command_sync(add_args, &netid_stdout)) {
+        return FALSE;
+    }
+
+    g_strstrip(netid_stdout);
+    if (!g_ascii_isdigit(netid_stdout[0])) {
+        g_printerr("WiFi: unexpected network id response: %s\n", netid_stdout);
+        goto cleanup;
+    }
+
+    gint netid = atoi(netid_stdout);
+    netid_str = g_strdup_printf("%d", netid);
+
+    ssid_value = quote_wpa_cli_string(ssid);
+    if (!ssid_value) {
+        goto cleanup;
+    }
+    gchar * const set_ssid[] = {"wpa_cli", "-i", (gchar *)iface, "set_network", netid_str, "ssid", ssid_value, NULL};
+    if (!run_command_sync(set_ssid, NULL)) {
+        goto cleanup;
+    }
+
+    psk_value = format_psk_value(passphrase);
+    if (!psk_value) {
+        g_printerr("WiFi: invalid passphrase length\n");
+        goto cleanup;
+    }
+    gchar * const set_psk[] = {"wpa_cli", "-i", (gchar *)iface, "set_network", netid_str, "psk", psk_value, NULL};
+    if (!run_command_sync(set_psk, NULL)) {
+        goto cleanup;
+    }
+
+    bssid_lower = g_ascii_strdown(bssid, -1);
+    gchar * const set_bssid[] = {"wpa_cli", "-i", (gchar *)iface, "set_network", netid_str, "bssid", bssid_lower, NULL};
+    if (!run_command_sync(set_bssid, NULL)) {
+        goto cleanup;
+    }
+
+    gchar * const set_scan[] = {"wpa_cli", "-i", (gchar *)iface, "set_network", netid_str, "scan_ssid", "1", NULL};
+    if (!run_command_sync(set_scan, NULL)) {
+        goto cleanup;
+    }
+
+    gchar * const keymgmt[] = {"wpa_cli", "-i", (gchar *)iface, "set_network", netid_str, "key_mgmt", "WPA-PSK", NULL};
+    run_command_sync(keymgmt, NULL);
+
+    gchar * const enable_network[] = {"wpa_cli", "-i", (gchar *)iface, "enable_network", netid_str, NULL};
+    if (!run_command_sync(enable_network, NULL)) {
+        goto cleanup;
+    }
+
+    gchar * const select_network[] = {"wpa_cli", "-i", (gchar *)iface, "select_network", netid_str, NULL};
+    if (!run_command_sync(select_network, NULL)) {
+        goto cleanup;
+    }
+
+    gchar * const save_config[] = {"wpa_cli", "-i", (gchar *)iface, "save_config", NULL};
+    run_command_sync(save_config, NULL);
+
+    gchar * const reassociate[] = {"wpa_cli", "-i", (gchar *)iface, "reassociate", NULL};
+    run_command_sync(reassociate, NULL);
+
+    for (guint attempt = 0; attempt < 30; attempt++) {
+        gchar *ip_value = NULL;
+        if (get_interface_ipv4(iface, &ip_value) && ip_value && ip_value[0] != '\0') {
+            *ip_address_out = ip_value;
+            success = TRUE;
+            break;
+        }
+        g_free(ip_value);
+        g_usleep(500000);
+    }
+
+cleanup:
+    if (!success && netid_str) {
+        gchar * const remove_network[] = {"wpa_cli", "-i", (gchar *)iface, "remove_network", netid_str, NULL};
+        run_command_sync(remove_network, NULL);
+    }
+
+    g_free(netid_stdout);
+    g_free(netid_str);
+    g_free(ssid_value);
+    g_free(psk_value);
+    g_free(bssid_lower);
+    return success;
+}
+
+static gboolean handle_wifi_connect_request(CustomData *data, json_t *payload) {
+    if (!data) {
+        return FALSE;
+    }
+
+    if (!payload || !json_is_object(payload)) {
+        g_printerr("Serial: Wi-Fi connect payload missing\n");
+        return respond_with_status(data, 3);
+    }
+
+    json_t *bssid_node = json_object_get(payload, "BSSID");
+    json_t *pass_node = json_object_get(payload, "pass");
+    if (!json_is_string(bssid_node) || !json_is_string(pass_node)) {
+        g_printerr("Serial: Wi-Fi connect payload missing BSSID or pass fields\n");
+        return respond_with_status(data, 3);
+    }
+
+    const char *target_bssid = json_string_value(bssid_node);
+    const char *passphrase = json_string_value(pass_node);
+    if (!validate_bssid_format(target_bssid)) {
+        g_printerr("WiFi: invalid BSSID format: %s\n", target_bssid);
+        return respond_with_status(data, 3);
+    }
+
+    gchar *ssid = NULL;
+    if (!lookup_ssid_for_bssid(target_bssid, &ssid)) {
+        g_printerr("WiFi: unable to resolve SSID for BSSID %s\n", target_bssid);
+        return respond_with_status(data, 3);
+    }
+
+    const gchar *iface = resolve_wifi_interface_name();
+    g_print("WiFi: attempting connection on %s to %s\n", iface, target_bssid);
+
+    gchar *ip_address = NULL;
+    gboolean connected = connect_to_wifi_bssid(iface, target_bssid, ssid, passphrase, &ip_address);
+    g_free(ssid);
+
+    if (!connected || !ip_address) {
+        g_printerr("WiFi: failed to connect to %s\n", target_bssid);
+        g_free(ip_address);
+        return respond_with_status(data, 3);
+    }
+
+    json_t *payload_obj = json_object();
+    json_object_set_new(payload_obj, "IPAddr", json_string(ip_address));
+    char *payload_str = json_dumps(payload_obj, JSON_COMPACT);
+    json_decref(payload_obj);
+    g_free(ip_address);
+
+    if (!payload_str) {
+        return respond_with_status(data, 3);
+    }
+
+    gboolean success = respond_with_payload(data, 2, payload_str);
+    free(payload_str);
+    return success;
+}
+
 static gboolean handle_wifi_scan_request(CustomData *data) {
     json_t *wifi_networks = NULL;
     if (!collect_wifi_networks(&wifi_networks)) {
@@ -659,6 +1013,15 @@ static gboolean process_serial_request(CustomData *data, json_t *message) {
             g_print("Serial: received status %d Wi-Fi scan request\n", status_code);
             if (!handle_wifi_scan_request(data)) {
                 g_printerr("Serial: failed to respond to Wi-Fi scan request\n");
+                return FALSE;
+            }
+            return TRUE;
+        }
+        case 22: {
+            g_print("Serial: received status %d Wi-Fi connect request\n", status_code);
+            json_t *payload = json_object_get(message, "payload");
+            if (!handle_wifi_connect_request(data, payload)) {
+                g_printerr("Serial: failed to respond to Wi-Fi connect request\n");
                 return FALSE;
             }
             return TRUE;
