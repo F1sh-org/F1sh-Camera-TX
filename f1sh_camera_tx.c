@@ -620,8 +620,8 @@ static gboolean process_serial_request(CustomData *data, json_t *message) {
             // No payload required for this status; simple echo response.
             return respond_with_status(data, 1);
         }
-        case 4: {
-            g_print("Serial: received status 4 Wi-Fi scan request\n");
+        case 21: {
+            g_print("Serial: received status %d Wi-Fi scan request\n", status_code);
             if (!handle_wifi_scan_request(data)) {
                 g_printerr("Serial: failed to respond to Wi-Fi scan request\n");
                 return FALSE;
