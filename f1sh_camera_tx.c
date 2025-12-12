@@ -422,6 +422,25 @@ static gboolean respond_with_payload(CustomData *data, gint status_code, const c
     return success;
 }
 
+static gboolean respond_with_payload(CustomData *data, gint status_code, const char *payload) {
+    json_t *response = json_object();
+    json_object_set_new(response, "status", json_integer(status_code));
+    const char *payload_value = payload ? payload : "";
+    gchar *sanitized_payload = NULL;
+    if (!g_utf8_validate(payload_value, -1, NULL)) {
+        sanitized_payload = sanitize_utf8(payload_value);
+        payload_value = sanitized_payload ? sanitized_payload : "";
+        g_printerr("Serial: payload contained invalid UTF-8, sanitized before sending\n");
+    }
+
+    json_object_set_new(response, "payload", json_string(payload_value));
+    log_serial_json("payload", response);
+    g_free(sanitized_payload);
+    gboolean success = serial_send_json(data, response);
+    json_decref(response);
+    return success;
+}
+
 static gchar* sanitize_utf8(const char *value) {
     if (!value) {
         return g_strdup("");
