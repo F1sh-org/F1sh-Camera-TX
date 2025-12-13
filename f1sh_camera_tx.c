@@ -109,6 +109,8 @@ static gboolean respond_with_payload(CustomData *data, gint status_code, const c
 static gboolean handle_wifi_scan_request(CustomData *data);
 static gboolean handle_config_request(CustomData *data);
 static gboolean handle_wifi_connect_request(CustomData *data, json_t *payload);
+static gboolean handle_swap_resolution_request(CustomData *data, json_t *payload);
+static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out);
 static gboolean collect_wifi_networks(json_t **result_array);
 static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length);
 static gchar* sanitize_utf8(const gchar *value);
@@ -937,6 +939,75 @@ static gboolean handle_wifi_connect_request(CustomData *data, json_t *payload) {
     return success;
 }
 
+static gboolean handle_swap_resolution_request(CustomData *data, json_t *payload) {
+    if (!data) {
+        return FALSE;
+    }
+
+    if (!payload || !json_is_object(payload)) {
+        g_printerr("Serial: swap request missing payload\n");
+        return respond_with_status(data, 3);
+    }
+
+    json_t *swap_node = json_object_get(payload, "swap");
+    if (!json_is_integer(swap_node)) {
+        g_printerr("Serial: swap request missing 'swap' integer\n");
+        return respond_with_status(data, 3);
+    }
+
+    gint swap_flag = (gint)json_integer_value(swap_node);
+    if (swap_flag != 0 && swap_flag != 1) {
+        g_printerr("Serial: swap flag must be 0 or 1, got %d\n", swap_flag);
+        return respond_with_status(data, 3);
+    }
+
+    if (swap_flag == 0) {
+        return respond_with_status(data, 24);
+    }
+
+    gboolean persisted = TRUE;
+    if (!swap_config_resolution(data, &persisted)) {
+        return respond_with_status(data, 3);
+    }
+
+    if (!persisted) {
+        g_printerr("Serial: failed to persist swapped resolution\n");
+    }
+
+    return respond_with_status(data, 24);
+}
+
+static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out) {
+    if (!data) {
+        return FALSE;
+    }
+
+    if (persisted_out) {
+        *persisted_out = TRUE;
+    }
+
+    g_mutex_lock(&data->state_mutex);
+    gint tmp = data->config.width;
+    data->config.width = data->config.height;
+    data->config.height = tmp;
+    data->pipeline_is_restarting = TRUE;
+
+    gboolean persisted = TRUE;
+    if (data->config_file_path) {
+        persisted = save_config_to_file(&data->config, data->config_file_path);
+    } else {
+        persisted = FALSE;
+    }
+
+    g_mutex_unlock(&data->state_mutex);
+
+    if (persisted_out) {
+        *persisted_out = persisted;
+    }
+
+    return TRUE;
+}
+
 static gboolean handle_wifi_scan_request(CustomData *data) {
     json_t *wifi_networks = NULL;
     if (!collect_wifi_networks(&wifi_networks)) {
@@ -1022,6 +1093,15 @@ static gboolean process_serial_request(CustomData *data, json_t *message) {
             json_t *payload = json_object_get(message, "payload");
             if (!handle_wifi_connect_request(data, payload)) {
                 g_printerr("Serial: failed to respond to Wi-Fi connect request\n");
+                return FALSE;
+            }
+            return TRUE;
+        }
+        case 24: {
+            g_print("Serial: received status %d swap resolution request\n", status_code);
+            json_t *payload = json_object_get(message, "payload");
+            if (!handle_swap_resolution_request(data, payload)) {
+                g_printerr("Serial: failed to respond to swap resolution request\n");
                 return FALSE;
             }
             return TRUE;
@@ -1495,7 +1575,7 @@ static enum MHD_Result handle_get_stats(struct MHD_Connection *connection, Custo
 }
 
 // Handle GET requests
-static enum MHD_Result handle_get_request(struct MHD_Connection *connection, const char *url) {
+static enum MHD_Result handle_get_request(struct MHD_Connection *connection, const char *url, CustomData *data) {
     if (strcmp(url, "/get") == 0) {
         // Return available cameras and encoders
         json_t *root = json_object();
@@ -1505,6 +1585,33 @@ static enum MHD_Result handle_get_request(struct MHD_Connection *connection, con
         char *json_str = json_dumps(root, JSON_INDENT(2));
         json_decref(root);
         
+        enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
+        free(json_str);
+        return ret;
+    } else if (strcmp(url, "/swap") == 0) {
+        if (!data) {
+            return send_json_response(connection, "{\"error\":\"Server error\"}", MHD_HTTP_INTERNAL_SERVER_ERROR);
+        }
+
+        gboolean persisted = TRUE;
+        if (!swap_config_resolution(data, &persisted)) {
+            return send_json_response(connection, "{\"error\":\"Swap failed\"}", MHD_HTTP_INTERNAL_SERVER_ERROR);
+        }
+
+        gint width, height;
+        g_mutex_lock(&data->state_mutex);
+        width = data->config.width;
+        height = data->config.height;
+        g_mutex_unlock(&data->state_mutex);
+
+        json_t *root = json_object();
+        json_object_set_new(root, "status", json_string("swapped"));
+        json_object_set_new(root, "width", json_integer(width));
+        json_object_set_new(root, "height", json_integer(height));
+        json_object_set_new(root, "persisted", json_boolean(persisted));
+
+        char *json_str = json_dumps(root, JSON_INDENT(2));
+        json_decref(root);
         enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
         free(json_str);
         return ret;
@@ -1687,7 +1794,7 @@ static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *co
     if (0 == strcmp(method, "GET")) {
         if (0 == strcmp(url, "/health")) return handle_health(connection);
         if (0 == strcmp(url, "/stats")) return handle_get_stats(connection, data);
-        if (0 == strncmp(url, "/get", 4)) return handle_get_request(connection, url);
+        if (0 == strncmp(url, "/get", 4)) return handle_get_request(connection, url, data);
     } else if (0 == strcmp(method, "POST") && 0 == strcmp(url, "/config")) {
         struct connection_info_struct *con_info = *con_cls;
         if (*upload_data_size != 0) {
