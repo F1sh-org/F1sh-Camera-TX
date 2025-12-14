@@ -110,6 +110,7 @@ static gboolean handle_wifi_scan_request(CustomData *data);
 static gboolean handle_config_request(CustomData *data);
 static gboolean handle_wifi_connect_request(CustomData *data, json_t *payload);
 static gboolean handle_swap_resolution_request(CustomData *data, json_t *payload);
+static gboolean handle_host_update_request(CustomData *data, json_t *payload);
 static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out);
 static gboolean collect_wifi_networks(json_t **result_array);
 static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length);
@@ -977,6 +978,64 @@ static gboolean handle_swap_resolution_request(CustomData *data, json_t *payload
     return respond_with_status(data, 24);
 }
 
+static gboolean handle_host_update_request(CustomData *data, json_t *payload) {
+    if (!data) {
+        return FALSE;
+    }
+
+    if (!payload || !json_is_object(payload)) {
+        g_printerr("Serial: host update payload missing\n");
+        return respond_with_status(data, 3);
+    }
+
+    json_t *ip_node = json_object_get(payload, "IPAddr");
+    if (!json_is_string(ip_node)) {
+        g_printerr("Serial: host update missing IPAddr string\n");
+        return respond_with_status(data, 3);
+    }
+
+    const char *new_host = json_string_value(ip_node);
+    if (!new_host || new_host[0] == '\0') {
+        g_printerr("Serial: host update received empty IPAddr\n");
+        return respond_with_status(data, 3);
+    }
+
+    gboolean updated = FALSE;
+    gboolean persisted = TRUE;
+
+    g_mutex_lock(&data->state_mutex);
+    if (!data->config.host || strcmp(data->config.host, new_host) != 0) {
+        g_free(data->config.host);
+        data->config.host = g_strdup(new_host);
+        updated = TRUE;
+
+        if (data->config_file_path) {
+            persisted = save_config_to_file(&data->config, data->config_file_path);
+        } else {
+            persisted = FALSE;
+        }
+    }
+    GstElement *pipeline = data->pipeline;
+    g_mutex_unlock(&data->state_mutex);
+
+    if (updated && pipeline) {
+        GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+        if (sink) {
+            g_object_set(sink, "host", new_host, NULL);
+            gst_object_unref(sink);
+            g_print("Serial: updated UDP sink host to %s\n", new_host);
+        } else {
+            g_printerr("Serial: could not find UDP sink to update host\n");
+        }
+    }
+
+    if (!persisted) {
+        g_printerr("Serial: failed to persist host update\n");
+    }
+
+    return respond_with_status(data, 23);
+}
+
 static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out) {
     if (!data) {
         return FALSE;
@@ -1093,6 +1152,15 @@ static gboolean process_serial_request(CustomData *data, json_t *message) {
             json_t *payload = json_object_get(message, "payload");
             if (!handle_wifi_connect_request(data, payload)) {
                 g_printerr("Serial: failed to respond to Wi-Fi connect request\n");
+                return FALSE;
+            }
+            return TRUE;
+        }
+        case 23: {
+            g_print("Serial: received status %d host update request\n", status_code);
+            json_t *payload = json_object_get(message, "payload");
+            if (!handle_host_update_request(data, payload)) {
+                g_printerr("Serial: failed to respond to host update request\n");
                 return FALSE;
             }
             return TRUE;
