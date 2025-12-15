@@ -112,6 +112,8 @@ static gboolean handle_wifi_connect_request(CustomData *data, json_t *payload);
 static gboolean handle_swap_resolution_request(CustomData *data, json_t *payload);
 static gboolean handle_host_update_request(CustomData *data, json_t *payload);
 static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out);
+static gboolean ensure_resolution_orientation(CustomData *data, gboolean want_swapped,
+                                              gboolean *changed_out, gboolean *persisted_out);
 static gboolean collect_wifi_networks(json_t **result_array);
 static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length);
 static gchar* sanitize_utf8(const gchar *value);
@@ -1067,6 +1069,62 @@ static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out
     return TRUE;
 }
 
+static gboolean ensure_resolution_orientation(CustomData *data, gboolean want_swapped,
+                                              gboolean *changed_out, gboolean *persisted_out) {
+    if (!data) {
+        return FALSE;
+    }
+
+    if (changed_out) {
+        *changed_out = FALSE;
+    }
+    if (persisted_out) {
+        *persisted_out = TRUE;
+    }
+
+    g_mutex_lock(&data->state_mutex);
+    gboolean need_swap = FALSE;
+    if (want_swapped) {
+        // Swapped orientation: width <= height
+        if (data->config.width >= data->config.height) {
+            need_swap = TRUE;
+        }
+    } else {
+        // Unswapped orientation: width >= height
+        if (data->config.width < data->config.height) {
+            need_swap = TRUE;
+        }
+    }
+
+    if (need_swap) {
+        gint tmp = data->config.width;
+        data->config.width = data->config.height;
+        data->config.height = tmp;
+        data->pipeline_is_restarting = TRUE;
+        if (changed_out) {
+            *changed_out = TRUE;
+        }
+    }
+
+    gboolean persisted = TRUE;
+    if (data->config_file_path) {
+        persisted = save_config_to_file(&data->config, data->config_file_path);
+    } else {
+        persisted = FALSE;
+    }
+
+    gint width = data->config.width;
+    gint height = data->config.height;
+    g_mutex_unlock(&data->state_mutex);
+
+    if (persisted_out) {
+        *persisted_out = persisted;
+    }
+
+    // Return width/height via changed_out/persisted_out not required; callers may re-read.
+    return TRUE;
+}
+
 static gboolean handle_wifi_scan_request(CustomData *data) {
     json_t *wifi_networks = NULL;
     if (!collect_wifi_networks(&wifi_networks)) {
@@ -1661,8 +1719,9 @@ static enum MHD_Result handle_get_request(struct MHD_Connection *connection, con
             return send_json_response(connection, "{\"error\":\"Server error\"}", MHD_HTTP_INTERNAL_SERVER_ERROR);
         }
 
+        gboolean changed = FALSE;
         gboolean persisted = TRUE;
-        if (!swap_config_resolution(data, &persisted)) {
+        if (!ensure_resolution_orientation(data, TRUE, &changed, &persisted)) {
             return send_json_response(connection, "{\"error\":\"Swap failed\"}", MHD_HTTP_INTERNAL_SERVER_ERROR);
         }
 
@@ -1677,6 +1736,36 @@ static enum MHD_Result handle_get_request(struct MHD_Connection *connection, con
         json_object_set_new(root, "width", json_integer(width));
         json_object_set_new(root, "height", json_integer(height));
         json_object_set_new(root, "persisted", json_boolean(persisted));
+        json_object_set_new(root, "changed", json_boolean(changed));
+
+        char *json_str = json_dumps(root, JSON_INDENT(2));
+        json_decref(root);
+        enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
+        free(json_str);
+        return ret;
+    } else if (strcmp(url, "/noswap") == 0) {
+        if (!data) {
+            return send_json_response(connection, "{\"error\":\"Server error\"}", MHD_HTTP_INTERNAL_SERVER_ERROR);
+        }
+
+        gboolean changed = FALSE;
+        gboolean persisted = TRUE;
+        if (!ensure_resolution_orientation(data, FALSE, &changed, &persisted)) {
+            return send_json_response(connection, "{\"error\":\"Swap failed\"}", MHD_HTTP_INTERNAL_SERVER_ERROR);
+        }
+
+        gint width, height;
+        g_mutex_lock(&data->state_mutex);
+        width = data->config.width;
+        height = data->config.height;
+        g_mutex_unlock(&data->state_mutex);
+
+        json_t *root = json_object();
+        json_object_set_new(root, "status", json_string("unswapped"));
+        json_object_set_new(root, "width", json_integer(width));
+        json_object_set_new(root, "height", json_integer(height));
+        json_object_set_new(root, "persisted", json_boolean(persisted));
+        json_object_set_new(root, "changed", json_boolean(changed));
 
         char *json_str = json_dumps(root, JSON_INDENT(2));
         json_decref(root);
@@ -1863,6 +1952,7 @@ static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *co
         if (0 == strcmp(url, "/health")) return handle_health(connection);
         if (0 == strcmp(url, "/stats")) return handle_get_stats(connection, data);
         if (0 == strcmp(url, "/swap")) return handle_get_request(connection, url, data);
+        if (0 == strcmp(url, "/noswap")) return handle_get_request(connection, url, data);
         if (0 == strncmp(url, "/get", 4)) return handle_get_request(connection, url, data);
     } else if (0 == strcmp(method, "POST") && 0 == strcmp(url, "/config")) {
         struct connection_info_struct *con_info = *con_cls;
