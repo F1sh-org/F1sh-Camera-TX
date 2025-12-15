@@ -1862,6 +1862,7 @@ static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *co
     if (0 == strcmp(method, "GET")) {
         if (0 == strcmp(url, "/health")) return handle_health(connection);
         if (0 == strcmp(url, "/stats")) return handle_get_stats(connection, data);
+        if (0 == strcmp(url, "/swap")) return handle_get_request(connection, url, data);
         if (0 == strncmp(url, "/get", 4)) return handle_get_request(connection, url, data);
     } else if (0 == strcmp(method, "POST") && 0 == strcmp(url, "/config")) {
         struct connection_info_struct *con_info = *con_cls;
