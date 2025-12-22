@@ -3,7 +3,6 @@
 #include <glob.h>
 #include <gst/gst.h>
 #include <jansson.h>
-#include <microhttpd.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +10,6 @@
 #include <termios.h>
 #include <unistd.h>
 #include <errno.h>
-#include <microhttpd.h>
 #include <jansson.h>
 #include <glob.h>
 #include <glib.h>
@@ -21,7 +19,6 @@
 #include <TargetConditionals.h>
 #endif
 
-#define HTTP_PORT 8888
 #define DEFAULT_SERIAL_DEVICE "/dev/ttyGS0"
 #define DEFAULT_WIFI_INTERFACE "wlan0"
 #define DEFAULT_CONFIG_FILENAME "config.json"
@@ -71,7 +68,6 @@ typedef struct {
 typedef struct _CustomData {
     GstElement *pipeline;
     GstBus *bus;
-    struct MHD_Daemon *daemon;
     AppConfig config;
     StreamStats stats;
     GMutex state_mutex;
@@ -80,12 +76,6 @@ typedef struct _CustomData {
     SerialContext serial;
     gchar *config_file_path;
 } CustomData;
-
-struct connection_info_struct {
-    char *json_data;
-    size_t data_size;
-    CustomData *custom_data;
-};
 
 // Function declarations
 static gboolean build_and_run_pipeline(CustomData *data);
@@ -1652,338 +1642,6 @@ static json_t* get_camera_resolutions(const gchar *camera_name) {
     return resolutions;
 }
 
-// Send JSON response
-static enum MHD_Result send_json_response(struct MHD_Connection *connection, const char *json_str, int status_code) {
-    struct MHD_Response *response = MHD_create_response_from_buffer(strlen(json_str), 
-                                                                   (void*)json_str, 
-                                                                   MHD_RESPMEM_MUST_COPY);
-    MHD_add_response_header(response, "Content-Type", "application/json");
-    MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
-    
-    enum MHD_Result ret = MHD_queue_response(connection, status_code, response);
-    MHD_destroy_response(response);
-    
-    return ret;
-}
-
-// Handle health check
-static enum MHD_Result handle_health(struct MHD_Connection *connection) {
-    return send_json_response(connection, "{\"status\":\"healthy\"}", MHD_HTTP_OK);
-}
-
-// Handle statistics
-static enum MHD_Result handle_get_stats(struct MHD_Connection *connection, CustomData *data) {
-    g_mutex_lock(&data->stats.stats_mutex);
-    
-    // Calculate current bitrate
-    GstClockTime current_time = gst_clock_get_time(gst_system_clock_obtain());
-    GstClockTime elapsed = current_time - data->stats.start_time;
-    gdouble elapsed_seconds = (gdouble)elapsed / GST_SECOND;
-    
-    gdouble current_bitrate = 0.0;
-    if (elapsed_seconds > 0) {
-        current_bitrate = (data->stats.total_bytes * 8.0) / (elapsed_seconds * 1000.0); // kbps
-    }
-    
-    json_t *root = json_object();
-    json_object_set_new(root, "total_bytes", json_integer(data->stats.total_bytes));
-    json_object_set_new(root, "frame_count", json_integer(data->stats.frame_count));
-    json_object_set_new(root, "current_bitrate_kbps", json_real(current_bitrate));
-    
-    g_mutex_unlock(&data->stats.stats_mutex);
-
-    char *json_str = json_dumps(root, 0);
-    json_decref(root);
-
-    enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
-    free(json_str);
-    return ret;
-}
-
-// Handle GET requests
-static enum MHD_Result handle_get_request(struct MHD_Connection *connection, const char *url, CustomData *data) {
-    if (strcmp(url, "/get") == 0) {
-        // Return available cameras and encoders
-        json_t *root = json_object();
-        json_object_set_new(root, "cameras", get_available_cameras());
-        json_object_set_new(root, "encoders", get_available_encoders());
-        
-        char *json_str = json_dumps(root, JSON_INDENT(2));
-        json_decref(root);
-        
-        enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
-        free(json_str);
-        return ret;
-    } else if (strcmp(url, "/swap") == 0) {
-        if (!data) {
-            return send_json_response(connection, "{\"error\":\"Server error\"}", MHD_HTTP_INTERNAL_SERVER_ERROR);
-        }
-
-        gboolean changed = FALSE;
-        gboolean persisted = TRUE;
-        if (!ensure_resolution_orientation(data, TRUE, &changed, &persisted)) {
-            return send_json_response(connection, "{\"error\":\"Swap failed\"}", MHD_HTTP_INTERNAL_SERVER_ERROR);
-        }
-
-        gint width, height;
-        g_mutex_lock(&data->state_mutex);
-        width = data->config.width;
-        height = data->config.height;
-        g_mutex_unlock(&data->state_mutex);
-
-        json_t *root = json_object();
-        json_object_set_new(root, "status", json_string("swapped"));
-        json_object_set_new(root, "width", json_integer(width));
-        json_object_set_new(root, "height", json_integer(height));
-        json_object_set_new(root, "persisted", json_boolean(persisted));
-        json_object_set_new(root, "changed", json_boolean(changed));
-
-        char *json_str = json_dumps(root, JSON_INDENT(2));
-        json_decref(root);
-        enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
-        free(json_str);
-        return ret;
-    } else if (strcmp(url, "/noswap") == 0) {
-        if (!data) {
-            return send_json_response(connection, "{\"error\":\"Server error\"}", MHD_HTTP_INTERNAL_SERVER_ERROR);
-        }
-
-        gboolean changed = FALSE;
-        gboolean persisted = TRUE;
-        if (!ensure_resolution_orientation(data, FALSE, &changed, &persisted)) {
-            return send_json_response(connection, "{\"error\":\"Swap failed\"}", MHD_HTTP_INTERNAL_SERVER_ERROR);
-        }
-
-        gint width, height;
-        g_mutex_lock(&data->state_mutex);
-        width = data->config.width;
-        height = data->config.height;
-        g_mutex_unlock(&data->state_mutex);
-
-        json_t *root = json_object();
-        json_object_set_new(root, "status", json_string("unswapped"));
-        json_object_set_new(root, "width", json_integer(width));
-        json_object_set_new(root, "height", json_integer(height));
-        json_object_set_new(root, "persisted", json_boolean(persisted));
-        json_object_set_new(root, "changed", json_boolean(changed));
-
-        char *json_str = json_dumps(root, JSON_INDENT(2));
-        json_decref(root);
-        enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
-        free(json_str);
-        return ret;
-    } else if (strncmp(url, "/get/", 5) == 0) {
-        // Return camera-specific information
-        const char *camera_name = url + 5;
-        
-        json_t *root = json_object();
-        json_object_set_new(root, "camera", json_string(camera_name));
-        json_object_set_new(root, "supported_resolutions", get_camera_resolutions(camera_name));
-        
-        char *json_str = json_dumps(root, JSON_INDENT(2));
-        json_decref(root);
-        
-        enum MHD_Result ret = send_json_response(connection, json_str, MHD_HTTP_OK);
-        free(json_str);
-        return ret;
-    }
-    
-    return send_json_response(connection, "{\"error\":\"Not Found\"}", MHD_HTTP_NOT_FOUND);
-}
-
-// Process configuration update
-static enum MHD_Result process_config_update(struct connection_info_struct *con_info) {
-    json_error_t error;
-    json_t *root = json_loadb(con_info->json_data, con_info->data_size, 0, &error);
-
-    if (!root) {
-        g_printerr("JSON error on line %d: %s\n", error.line, error.text);
-        return MHD_NO;
-    }
-
-    CustomData *data = con_info->custom_data;
-    g_mutex_lock(&data->state_mutex);
-
-    json_t *value;
-    const char *str_val;
-    gboolean needs_pipeline_rebuild = FALSE;
-    gboolean needs_udp_update = FALSE;
-    gboolean config_modified = FALSE;
-
-    value = json_object_get(root, "host");
-    if (json_is_string(value)) {
-        str_val = json_string_value(value);
-        if (strcmp(data->config.host, str_val) != 0) {
-            g_free(data->config.host);
-            data->config.host = g_strdup(str_val);
-            needs_udp_update = TRUE;
-            config_modified = TRUE;
-        }
-    }
-    
-    value = json_object_get(root, "port");
-    if (json_is_integer(value)) {
-        gint new_port = json_integer_value(value);
-        if (data->config.port != new_port) {
-            data->config.port = new_port;
-            needs_udp_update = TRUE;
-            config_modified = TRUE;
-        }
-    }
-    
-    value = json_object_get(root, "camera");
-    if (json_is_string(value)) {
-        str_val = json_string_value(value);
-        if (strcmp(data->config.camera_name, str_val) != 0) {
-            g_free(data->config.camera_name);
-            data->config.camera_name = g_strdup(str_val);
-            needs_pipeline_rebuild = TRUE;
-            config_modified = TRUE;
-        }
-    }
-    
-    value = json_object_get(root, "encoder");
-    if (json_is_string(value)) {
-        str_val = json_string_value(value);
-        if (strcmp(data->config.encoder_type, str_val) != 0) {
-            g_free(data->config.encoder_type);
-            data->config.encoder_type = g_strdup(str_val);
-            needs_pipeline_rebuild = TRUE;
-            config_modified = TRUE;
-        }
-    }
-    
-    value = json_object_get(root, "width");
-    if (json_is_integer(value)) {
-        int new_width = json_integer_value(value);
-        if (new_width >= 320 && new_width <= 4608 && new_width != data->config.width) {
-            data->config.width = new_width;
-            needs_pipeline_rebuild = TRUE;
-            config_modified = TRUE;
-        } else if (new_width < 320 || new_width > 4608) {
-            g_print("Warning: Invalid width %d, keeping current value %d\n", new_width, data->config.width);
-        }
-    }
-    
-    value = json_object_get(root, "height");
-    if (json_is_integer(value)) {
-        int new_height = json_integer_value(value);
-        if (new_height >= 240 && new_height <= 2592 && new_height != data->config.height) {
-            data->config.height = new_height;
-            needs_pipeline_rebuild = TRUE;
-            config_modified = TRUE;
-        } else if (new_height < 240 || new_height > 2592) {
-            g_print("Warning: Invalid height %d, keeping current value %d\n", new_height, data->config.height);
-        }
-    }
-    
-    value = json_object_get(root, "framerate");
-    if (json_is_integer(value)) {
-        int new_framerate = json_integer_value(value);
-        if (new_framerate >= 1 && new_framerate <= 120 && new_framerate != data->config.framerate) {
-            data->config.framerate = new_framerate;
-            needs_pipeline_rebuild = TRUE;
-            config_modified = TRUE;
-        } else if (new_framerate < 1 || new_framerate > 120) {
-            g_print("Warning: Invalid framerate %d, keeping current value %d\n", new_framerate, data->config.framerate);
-        }
-    }
-
-    // Decide what kind of update to perform
-    if (needs_pipeline_rebuild) {
-        g_print("Configuration change requires pipeline rebuild: host=%s, port=%d, camera=%s, encoder=%s, %dx%d@%dfps\n", 
-                data->config.host, data->config.port, data->config.camera_name, data->config.encoder_type,
-                data->config.width, data->config.height, data->config.framerate);
-        data->pipeline_is_restarting = TRUE;
-    } else if (needs_udp_update && data->pipeline) {
-        g_print("Updating UDP sink destination: %s:%d (no pipeline rebuild needed)\n", 
-                data->config.host, data->config.port);
-        
-        // Find the UDP sink element and update its properties
-        GstElement *sink = gst_bin_get_by_name(GST_BIN(data->pipeline), "sink");
-        if (sink) {
-            g_object_set(sink, "host", data->config.host, "port", data->config.port, NULL);
-            gst_object_unref(sink);
-            g_print("UDP sink updated successfully\n");
-        } else {
-            g_printerr("Could not find UDP sink element for update\n");
-        }
-    } else {
-        g_print("Configuration updated (no changes required): host=%s, port=%d\n", 
-                data->config.host, data->config.port);
-    }
-
-    if (config_modified) {
-        if (data->config_file_path) {
-            if (!save_config_to_file(&data->config, data->config_file_path)) {
-                g_printerr("Failed to persist configuration after update\n");
-            }
-        } else {
-            g_printerr("Configuration path unset; cannot persist update\n");
-        }
-    }
-
-    g_mutex_unlock(&data->state_mutex);
-    json_decref(root);
-
-    return MHD_YES;
-}
-
-static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *connection,
-                                            const char *url, const char *method,
-                                            const char *version __attribute__((unused)), const char *upload_data,
-                                            size_t *upload_data_size, void **con_cls) {
-    CustomData *data = (CustomData *)cls;
-
-    if (NULL == *con_cls) {
-        if (0 == strcmp(method, "POST")) {
-            struct connection_info_struct *con_info = malloc(sizeof(struct connection_info_struct));
-            if (NULL == con_info) return MHD_NO;
-            con_info->json_data = NULL;
-            con_info->data_size = 0;
-            con_info->custom_data = data;
-            *con_cls = (void *)con_info;
-            return MHD_YES;
-        }
-        *con_cls = (void *)1; // Mark as handled for GET requests
-    }
-
-    if (0 == strcmp(method, "GET")) {
-        if (0 == strcmp(url, "/health")) return handle_health(connection);
-        if (0 == strcmp(url, "/stats")) return handle_get_stats(connection, data);
-        if (0 == strcmp(url, "/swap")) return handle_get_request(connection, url, data);
-        if (0 == strcmp(url, "/noswap")) return handle_get_request(connection, url, data);
-        if (0 == strncmp(url, "/get", 4)) return handle_get_request(connection, url, data);
-    } else if (0 == strcmp(method, "POST") && 0 == strcmp(url, "/config")) {
-        struct connection_info_struct *con_info = *con_cls;
-        if (*upload_data_size != 0) {
-            con_info->json_data = realloc(con_info->json_data, con_info->data_size + *upload_data_size);
-            memcpy(con_info->json_data + con_info->data_size, upload_data, *upload_data_size);
-            con_info->data_size += *upload_data_size;
-            *upload_data_size = 0;
-            return MHD_YES;
-        } else {
-            // End of upload, process the data
-            if (MHD_YES == process_config_update(con_info)) {
-                return send_json_response(connection, "{\"status\":\"configuration updated\"}", MHD_HTTP_OK);
-            } else {
-                return send_json_response(connection, "{\"error\":\"Invalid JSON\"}", MHD_HTTP_BAD_REQUEST);
-            }
-        }
-    }
-
-    return send_json_response(connection, "{\"error\":\"Not Found\"}", MHD_HTTP_NOT_FOUND);
-}
-
-static void request_completed(void *cls __attribute__((unused)), struct MHD_Connection *connection __attribute__((unused)),
-                              void **con_cls, enum MHD_RequestTerminationCode toe __attribute__((unused))) {
-    struct connection_info_struct *con_info = *con_cls;
-    if (NULL == con_info || con_info == (void *)1) return;
-    if (con_info->json_data) free(con_info->json_data);
-    free(con_info);
-    *con_cls = NULL;
-}
-
 static gboolean build_and_run_pipeline(CustomData *data) {
     g_mutex_lock(&data->state_mutex);
     g_print("Building pipeline with config: host=%s, port=%d, camera=%s, encoder=%s, %dx%d@%dfps\n",
@@ -2299,29 +1957,6 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    data.daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD, HTTP_PORT, NULL, NULL,
-                                   &answer_to_connection, &data,
-                                   MHD_OPTION_NOTIFY_COMPLETED, request_completed, NULL,
-                                   MHD_OPTION_END);
-    if (NULL == data.daemon) {
-        g_printerr("Failed to start HTTP server.\n");
-        exit_code = -1;
-        goto cleanup;
-        free_config_members(&data.config);
-        free_stats(&data.stats);
-        g_mutex_clear(&data.state_mutex);
-        g_free(data.config_file_path);
-        return -1;
-    }
-
-    g_print("HTTP server started on port %d\n", HTTP_PORT);
-    g_print("Available endpoints:\n");
-    g_print("  GET  /health - Health check\n");
-    g_print("  GET  /stats - Stream statistics\n");
-    g_print("  GET  /get - List available cameras and encoders\n");
-    g_print("  GET  /get/[camera_name] - Get camera-specific information\n");
-    g_print("  POST /config - Update configuration\n");
-
     do {
         g_mutex_lock(&data.state_mutex);
         
@@ -2368,8 +2003,7 @@ int main(int argc, char *argv[]) {
                         
                         // Log encoder errors but don't auto-fallback to avoid infinite loops
                         if (strstr(GST_OBJECT_NAME(msg->src), "encoder")) {
-                            g_printerr("Encoder error detected. Consider using a different encoder via /config API.\n");
-                            g_printerr("Try: curl -X POST http://localhost:8888/config -d '{\"encoder\":\"x264enc\"}'\n");
+                            g_printerr("Encoder error detected. Consider using a different encoder via serial config update.\n");
                         }
                         
                         data.should_terminate = TRUE;
@@ -2418,11 +2052,6 @@ int main(int argc, char *argv[]) {
     } while (!data.should_terminate);
 
 cleanup:
-    if (data.daemon) {
-        MHD_stop_daemon(data.daemon);
-        data.daemon = NULL;
-    }
-
     g_mutex_lock(&data.state_mutex);
     if (data.pipeline) {
         gst_element_set_state(data.pipeline, GST_STATE_NULL);
