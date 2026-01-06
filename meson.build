@@ -22,7 +22,7 @@ grpc_gen = custom_target('grpc_gen',
   output: ['f1sh_camera.grpc.pb.cc', 'f1sh_camera.grpc.pb.h'],
   command: [protoc,
             '--proto_path=@CURRENT_SOURCE_DIR@',
-            '--grpc_out=@BUILD_DIR@',
+            '--grpc_out=@OUTDIR@',
             '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(),
             '@INPUT@'])
 
