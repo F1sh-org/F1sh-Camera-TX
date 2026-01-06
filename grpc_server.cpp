@@ -1,7 +1,11 @@
 // gRPC service implementation with C wrapper for F1sh Camera TX
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
+
+// Server reflection support (optional - for grpcurl compatibility)
+#ifdef HAVE_GRPC_REFLECTION
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
+#endif
 
 #include "f1sh_camera.grpc.pb.h"
 #include "f1sh_camera.pb.h"
@@ -247,7 +251,11 @@ extern "C" f1sh_grpc_server_t* f1sh_grpc_server_start(const char* address, const
     srv->service = std::make_unique<F1shCameraServiceImpl>(callbacks);
 
     grpc::EnableDefaultHealthCheckService(true);
+
+#ifdef HAVE_GRPC_REFLECTION
+    // Enable server reflection for grpcurl/service discovery
     grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+#endif
 
     ServerBuilder builder;
     builder.AddListeningPort(address, grpc::InsecureServerCredentials());

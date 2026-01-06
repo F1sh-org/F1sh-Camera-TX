@@ -39,6 +39,24 @@ dependencies = [
   dependency('jansson'),
 ]
 
+# Find grpc++ reflection library (needed for grpcurl service discovery)
+grpc_reflection_dep = dependency('grpc++_reflection', required: false)
+if not grpc_reflection_dep.found()
+  # Try pkg-config alternative name
+  grpc_reflection_dep = meson.get_compiler('cpp').find_library('grpc++_reflection', required: false)
+endif
+
+# Compile definitions
+compile_args = []
+
+if grpc_reflection_dep.found()
+  dependencies += grpc_reflection_dep
+  compile_args += '-DHAVE_GRPC_REFLECTION=1'
+  message('grpc++_reflection found - service reflection enabled')
+else
+  message('grpc++_reflection not found - service reflection disabled')
+endif
+
 # Optional: Avahi for mDNS service discovery (Linux only)
 avahi_client_dep = dependency('avahi-client', required: false)
 avahi_glib_dep = dependency('avahi-glib', required: false)
@@ -54,6 +72,7 @@ exe = executable(
   'F1sh-Camera-TX',
   ['f1sh_camera_tx.c', 'grpc_server.cpp', proto_src, grpc_src],
   dependencies : dependencies,
+  cpp_args : compile_args,
   install : true,
 )
 
