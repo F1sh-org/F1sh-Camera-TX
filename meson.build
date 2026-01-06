@@ -1,18 +1,41 @@
 project(
   'F1sh-Camera-TX',
-  'c',
+  'c', 'cpp',
   meson_version : '>= 1.3.0',
   version : '0.1',
-  default_options : ['warning_level=3'],
+  default_options : ['warning_level=3', 'cpp_std=c++14'],
 )
+
+# Protobuf compiler
+protoc = find_program('protoc', required: true)
+grpc_cpp_plugin = find_program('grpc_cpp_plugin', required: true)
+
+# Generate protobuf and gRPC files
+protobuf_gen = generator(protoc,
+  output: ['@BASENAME@.pb.cc', '@BASENAME@.pb.h'],
+  arguments: ['--proto_path=@CURRENT_SOURCE_DIR@',
+              '--cpp_out=@BUILD_DIR@',
+              '@INPUT@'])
+
+grpc_gen = custom_target('grpc_gen',
+  input: 'f1sh_camera.proto',
+  output: ['f1sh_camera.grpc.pb.cc', 'f1sh_camera.grpc.pb.h'],
+  command: [protoc,
+            '--proto_path=@CURRENT_SOURCE_DIR@',
+            '--grpc_out=@BUILD_DIR@',
+            '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(),
+            '@INPUT@'])
+
+proto_src = protobuf_gen.process('f1sh_camera.proto')
+grpc_src = grpc_gen
 
 # Core dependencies (required)
 dependencies = [
   dependency('gstreamer-1.0'),
   dependency('gstreamer-app-1.0'),
   dependency('gstreamer-video-1.0'),
-  dependency('libmicrohttpd'),
-  dependency('jansson'),
+  dependency('grpc++'),
+  dependency('protobuf'),
 ]
 
 # Optional: Avahi for mDNS service discovery (Linux only)
@@ -28,7 +51,7 @@ endif
 
 exe = executable(
   'F1sh-Camera-TX',
-  'f1sh_camera_tx.c',
+  ['f1sh_camera_tx.c', 'grpc_server.cpp', proto_src, grpc_src],
   dependencies : dependencies,
   install : true,
 )
