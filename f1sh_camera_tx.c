@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <glib.h>
 #include <glib/gstdio.h>
+#include <jansson.h>
 #include "grpc_wrapper.h"
 
 #ifdef __APPLE__

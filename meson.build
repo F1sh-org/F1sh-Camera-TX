@@ -36,6 +36,7 @@ dependencies = [
   dependency('gstreamer-video-1.0'),
   dependency('grpc++'),
   dependency('protobuf'),
+  dependency('jansson'),
 ]
 
 # Optional: Avahi for mDNS service discovery (Linux only)
