@@ -85,7 +85,7 @@ typedef struct {
 typedef struct _CustomData {
     GstElement *pipeline;
     GstBus *bus;
-    grpc_server_t *grpc_server;
+    f1sh_grpc_server_t *grpc_server;
     AppConfig config;
     StreamStats stats;
     GMutex state_mutex;
@@ -2108,7 +2108,7 @@ int main(int argc, char *argv[]) {
     };
 
     // Start gRPC server
-    data.grpc_server = grpc_server_start("0.0.0.0:50051", &callbacks);
+    data.grpc_server = f1sh_grpc_server_start("0.0.0.0:50051", &callbacks);
     if (data.grpc_server == NULL) {
         g_printerr("Failed to start gRPC server.\n");
         exit_code = -1;
@@ -2235,7 +2235,7 @@ cleanup:
 #endif
 
     if (data.grpc_server) {
-        grpc_server_stop(data.grpc_server);
+        f1sh_grpc_server_stop(data.grpc_server);
         data.grpc_server = NULL;
     }
 

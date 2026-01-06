@@ -100,19 +100,19 @@ typedef struct {
 } grpc_callbacks;
 
 // Opaque server handle
-typedef struct grpc_server grpc_server_t;
+typedef struct f1sh_grpc_server f1sh_grpc_server_t;
 
 // Start gRPC server
 // address: e.g., "0.0.0.0:50051"
 // callbacks: callback structure (will be copied, so can be stack-allocated)
 // Returns: server handle, or NULL on failure
-grpc_server_t* grpc_server_start(const char* address, const grpc_callbacks* callbacks);
+f1sh_grpc_server_t* f1sh_grpc_server_start(const char* address, const grpc_callbacks* callbacks);
 
 // Stop gRPC server
-void grpc_server_stop(grpc_server_t* server);
+void f1sh_grpc_server_stop(f1sh_grpc_server_t* server);
 
 // Wait for server to finish (blocking)
-void grpc_server_wait(grpc_server_t* server);
+void f1sh_grpc_server_wait(f1sh_grpc_server_t* server);
 
 #ifdef __cplusplus
 }

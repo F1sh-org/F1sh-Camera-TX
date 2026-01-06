@@ -31,32 +31,6 @@ using f1sh_camera::UpdateHostResponse;
 using f1sh_camera::GetAvailableDevicesRequest;
 using f1sh_camera::GetAvailableDevicesResponse;
 
-// Forward declaration of callback structure
-struct grpc_callbacks {
-    // Health check
-    void (*health_callback)(void* user_data, char** status_out);
-
-    // Get stats
-    void (*get_stats_callback)(void* user_data, uint64_t* total_bytes, uint64_t* frame_count, double* bitrate);
-
-    // Get config
-    void (*get_config_callback)(void* user_data, grpc_config_t* config);
-
-    // Update config
-    int (*update_config_callback)(void* user_data, const grpc_config_update_t* update, grpc_config_t* new_config, char** error_msg);
-
-    // Swap resolution
-    int (*swap_resolution_callback)(void* user_data, grpc_config_t* new_config, char** error_msg);
-
-    // Update host
-    int (*update_host_callback)(void* user_data, const char* host, char** error_msg);
-
-    // Get available devices
-    void (*get_devices_callback)(void* user_data, grpc_devices_t* devices);
-
-    void* user_data;
-};
-
 // gRPC service implementation
 class F1shCameraServiceImpl final : public F1shCameraService::Service {
 public:
@@ -262,13 +236,13 @@ private:
 };
 
 // C wrapper implementation
-struct grpc_server {
+struct f1sh_grpc_server {
     std::unique_ptr<Server> server;
     std::unique_ptr<F1shCameraServiceImpl> service;
 };
 
-extern "C" grpc_server_t* grpc_server_start(const char* address, const grpc_callbacks* callbacks) {
-    grpc_server_t* srv = new grpc_server_t();
+extern "C" f1sh_grpc_server_t* f1sh_grpc_server_start(const char* address, const grpc_callbacks* callbacks) {
+    f1sh_grpc_server_t* srv = new f1sh_grpc_server_t();
 
     srv->service = std::make_unique<F1shCameraServiceImpl>(callbacks);
 
@@ -289,7 +263,7 @@ extern "C" grpc_server_t* grpc_server_start(const char* address, const grpc_call
     return srv;
 }
 
-extern "C" void grpc_server_stop(grpc_server_t* server) {
+extern "C" void f1sh_grpc_server_stop(f1sh_grpc_server_t* server) {
     if (server) {
         if (server->server) {
             server->server->Shutdown();
@@ -298,7 +272,7 @@ extern "C" void grpc_server_stop(grpc_server_t* server) {
     }
 }
 
-extern "C" void grpc_server_wait(grpc_server_t* server) {
+extern "C" void f1sh_grpc_server_wait(f1sh_grpc_server_t* server) {
     if (server && server->server) {
         server->server->Wait();
     }
