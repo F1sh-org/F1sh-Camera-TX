@@ -19,6 +19,15 @@
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
+// Avahi not available on macOS - disable mDNS features
+#define HAVE_AVAHI 0
+#else
+// Avahi available on Linux systems
+#define HAVE_AVAHI 1
+#include <avahi-client/client.h>
+#include <avahi-client/publish.h>
+#include <avahi-common/error.h>
+#include <avahi-glib/glib-watch.h>
 #endif
 
 #define HTTP_PORT 8888
@@ -68,6 +77,15 @@ typedef struct {
     gint signal_dbm;
 } WifiNetwork;
 
+#if HAVE_AVAHI
+// mDNS service advertisement context
+typedef struct {
+    AvahiGLibPoll *glib_poll;
+    AvahiClient *client;
+    AvahiEntryGroup *group;
+} MDNSContext;
+#endif
+
 typedef struct _CustomData {
     GstElement *pipeline;
     GstBus *bus;
@@ -79,6 +97,9 @@ typedef struct _CustomData {
     gboolean should_terminate;
     SerialContext serial;
     gchar *config_file_path;
+#if HAVE_AVAHI
+    MDNSContext mdns;
+#endif
 } CustomData;
 
 struct connection_info_struct {
@@ -126,6 +147,12 @@ static gboolean run_command_sync(gchar * const argv[], gchar **stdout_out);
 static gboolean get_interface_ipv4(const char *iface, gchar **ip_out);
 static gboolean connect_to_wifi_bssid(const char *iface, const char *bssid, const char *ssid,
                                       const char *passphrase, gchar **ip_address_out);
+#if HAVE_AVAHI
+static void mdns_client_callback(AvahiClient *client, AvahiClientState state, void *userdata);
+static void mdns_entry_group_callback(AvahiEntryGroup *group, AvahiEntryGroupState state, void *userdata);
+static gboolean init_mdns_service(CustomData *data);
+static void shutdown_mdns_service(CustomData *data);
+#endif
 
 // Probe callback to monitor data flow
 static GstPadProbeReturn
@@ -2144,6 +2171,175 @@ error:
     return FALSE;
 }
 
+#if HAVE_AVAHI
+// mDNS Entry Group callback - handles service registration state changes
+static void mdns_entry_group_callback(AvahiEntryGroup *group, AvahiEntryGroupState state, void *userdata) {
+    (void)userdata; // Unused parameter
+
+    switch (state) {
+        case AVAHI_ENTRY_GROUP_ESTABLISHED:
+            g_print("mDNS service 'F1sh Camera TX' successfully established\n");
+            break;
+
+        case AVAHI_ENTRY_GROUP_COLLISION:
+            g_printerr("mDNS service name collision, consider renaming the service\n");
+            break;
+
+        case AVAHI_ENTRY_GROUP_FAILURE:
+            g_printerr("mDNS entry group failure: %s\n",
+                      avahi_strerror(avahi_client_errno(avahi_entry_group_get_client(group))));
+            break;
+
+        case AVAHI_ENTRY_GROUP_UNCOMMITED:
+        case AVAHI_ENTRY_GROUP_REGISTERING:
+            break;
+    }
+}
+
+// mDNS Client callback - handles Avahi client state changes
+static void mdns_client_callback(AvahiClient *client, AvahiClientState state, void *userdata) {
+    CustomData *data = (CustomData *)userdata;
+
+    switch (state) {
+        case AVAHI_CLIENT_S_RUNNING:
+            // Client is running, create service entry group
+            if (!data->mdns.group) {
+                data->mdns.group = avahi_entry_group_new(client, mdns_entry_group_callback, data);
+                if (!data->mdns.group) {
+                    g_printerr("Failed to create mDNS entry group: %s\n",
+                              avahi_strerror(avahi_client_errno(client)));
+                    return;
+                }
+            }
+
+            // Add service to the entry group
+            if (avahi_entry_group_is_empty(data->mdns.group)) {
+                int ret;
+
+                // Register _http._tcp service for the HTTP API
+                ret = avahi_entry_group_add_service(
+                    data->mdns.group,
+                    AVAHI_IF_UNSPEC,           // Interface (any)
+                    AVAHI_PROTO_UNSPEC,        // Protocol (IPv4/IPv6)
+                    0,                          // Flags
+                    "F1sh Camera TX",          // Service name
+                    "_http._tcp",              // Service type
+                    NULL,                       // Domain (use default)
+                    NULL,                       // Host (use default)
+                    HTTP_PORT,                 // Port
+                    "path=/",                   // TXT record: API path
+                    "api=rest",                 // TXT record: API type
+                    "version=0.1",             // TXT record: version
+                    "type=camera",             // TXT record: device type
+                    NULL                        // End of TXT records
+                );
+
+                if (ret < 0) {
+                    g_printerr("Failed to add mDNS _http._tcp service: %s\n", avahi_strerror(ret));
+                    return;
+                }
+
+                // Register custom _f1sh-camera._tcp service for camera streaming
+                ret = avahi_entry_group_add_service(
+                    data->mdns.group,
+                    AVAHI_IF_UNSPEC,
+                    AVAHI_PROTO_UNSPEC,
+                    0,
+                    "F1sh Camera TX",
+                    "_f1sh-camera._tcp",
+                    NULL,
+                    NULL,
+                    data->config.port,         // UDP streaming port
+                    "protocol=udp",             // TXT record: protocol
+                    "encoding=h264",            // TXT record: video encoding
+                    "control_port=8888",        // TXT record: HTTP control port
+                    NULL
+                );
+
+                if (ret < 0) {
+                    g_printerr("Failed to add mDNS _f1sh-camera._tcp service: %s\n", avahi_strerror(ret));
+                    return;
+                }
+
+                // Commit the entry group
+                ret = avahi_entry_group_commit(data->mdns.group);
+                if (ret < 0) {
+                    g_printerr("Failed to commit mDNS entry group: %s\n", avahi_strerror(ret));
+                }
+            }
+            break;
+
+        case AVAHI_CLIENT_FAILURE:
+            g_printerr("mDNS client failure: %s\n", avahi_strerror(avahi_client_errno(client)));
+            break;
+
+        case AVAHI_CLIENT_S_COLLISION:
+        case AVAHI_CLIENT_S_REGISTERING:
+            // Remove existing services if any
+            if (data->mdns.group) {
+                avahi_entry_group_reset(data->mdns.group);
+            }
+            break;
+
+        case AVAHI_CLIENT_CONNECTING:
+            break;
+    }
+}
+
+// Initialize mDNS service advertisement
+static gboolean init_mdns_service(CustomData *data) {
+    int error;
+
+    // Create the GLib poll wrapper
+    data->mdns.glib_poll = avahi_glib_poll_new(NULL, G_PRIORITY_DEFAULT);
+    if (!data->mdns.glib_poll) {
+        g_printerr("Failed to create Avahi GLib poll object\n");
+        return FALSE;
+    }
+
+    // Create Avahi client
+    data->mdns.client = avahi_client_new(
+        avahi_glib_poll_get(data->mdns.glib_poll),
+        0,
+        mdns_client_callback,
+        data,
+        &error
+    );
+
+    if (!data->mdns.client) {
+        g_printerr("Failed to create Avahi client: %s\n", avahi_strerror(error));
+        avahi_glib_poll_free(data->mdns.glib_poll);
+        data->mdns.glib_poll = NULL;
+        return FALSE;
+    }
+
+    g_print("mDNS service advertising initialized\n");
+    g_print("Service discoverable as 'F1sh Camera TX' via mDNS/Bonjour/Zeroconf\n");
+
+    return TRUE;
+}
+
+// Shutdown mDNS service advertisement
+static void shutdown_mdns_service(CustomData *data) {
+    if (data->mdns.group) {
+        avahi_entry_group_free(data->mdns.group);
+        data->mdns.group = NULL;
+    }
+
+    if (data->mdns.client) {
+        avahi_client_free(data->mdns.client);
+        data->mdns.client = NULL;
+    }
+
+    if (data->mdns.glib_poll) {
+        avahi_glib_poll_free(data->mdns.glib_poll);
+        data->mdns.glib_poll = NULL;
+    }
+
+    g_print("mDNS service advertising stopped\n");
+}
+#endif
+
 int main(int argc, char *argv[]) {
     CustomData data;
     GstBus *bus;
@@ -2230,6 +2426,15 @@ int main(int argc, char *argv[]) {
     g_print("  GET  /get - List available cameras and encoders\n");
     g_print("  GET  /get/[camera_name] - Get camera-specific information\n");
     g_print("  POST /config - Update configuration\n");
+
+#if HAVE_AVAHI
+    // Initialize mDNS service advertisement
+    if (!init_mdns_service(&data)) {
+        g_printerr("Warning: Failed to initialize mDNS service advertisement. Continuing without mDNS.\n");
+    }
+#else
+    g_print("mDNS service advertisement not available on this platform\n");
+#endif
 
     do {
         g_mutex_lock(&data.state_mutex);
@@ -2327,6 +2532,10 @@ int main(int argc, char *argv[]) {
     } while (!data.should_terminate);
 
 cleanup:
+#if HAVE_AVAHI
+    shutdown_mdns_service(&data);
+#endif
+
     if (data.daemon) {
         MHD_stop_daemon(data.daemon);
         data.daemon = NULL;
