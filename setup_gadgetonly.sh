@@ -147,5 +147,5 @@ apt update && apt upgrade -y
 
 # Install required packages
 echo "Installing necessary packages..."
-apt install wget gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libcamera libcamera-apps libmicrohttpd-dev -y
+apt install wget gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libcamera libcamera-apps libmicrohttpd-dev libavahi-client-dev libavahi-glib-dev protobuf-compiler protobuf-compiler-grpc libgrpc++-dev libprotobuf-dev -y
 

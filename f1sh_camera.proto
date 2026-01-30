@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package f1sh_camera;
+
+// Configuration message
+message Config {
+  string host = 1;
+  int32 port = 2;
+  string camera_name = 3;
+  string encoder_type = 4;
+  int32 width = 5;
+  int32 height = 6;
+  int32 framerate = 7;
+}
+
+// Stream statistics
+message StreamStats {
+  uint64 total_bytes = 1;
+  uint64 frame_count = 2;
+  double current_bitrate = 3;
+}
+
+// Camera information
+message CameraInfo {
+  string name = 1;
+  string path = 2;
+}
+
+// Encoder information
+message EncoderInfo {
+  string name = 1;
+  bool available = 2;
+}
+
+// Available cameras and encoders
+message AvailableDevices {
+  repeated CameraInfo cameras = 1;
+  repeated EncoderInfo encoders = 2;
+}
+
+// Health check request/response
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+}
+
+// Get stats request/response
+message GetStatsRequest {}
+
+message GetStatsResponse {
+  StreamStats stats = 1;
+}
+
+// Get config request/response
+message GetConfigRequest {}
+
+message GetConfigResponse {
+  Config config = 1;
+}
+
+// Update config request/response
+message UpdateConfigRequest {
+  optional string host = 1;
+  optional int32 port = 2;
+  optional string camera_name = 3;
+  optional string encoder_type = 4;
+  optional int32 width = 5;
+  optional int32 height = 6;
+  optional int32 framerate = 7;
+}
+
+message UpdateConfigResponse {
+  bool success = 1;
+  string message = 2;
+  Config config = 3;
+}
+
+// Swap resolution request/response
+message SwapResolutionRequest {}
+
+message SwapResolutionResponse {
+  bool success = 1;
+  string message = 2;
+  Config config = 3;
+}
+
+// Update host request/response
+message UpdateHostRequest {
+  string host = 1;
+}
+
+message UpdateHostResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Get available devices request/response
+message GetAvailableDevicesRequest {}
+
+message GetAvailableDevicesResponse {
+  AvailableDevices devices = 1;
+}
+
+// F1sh Camera service definition
+service F1shCameraService {
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Get stream statistics
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+
+  // Get current configuration
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+
+  // Update configuration
+  rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
+
+  // Swap resolution (portrait/landscape toggle)
+  rpc SwapResolution(SwapResolutionRequest) returns (SwapResolutionResponse);
+
+  // Update UDP host
+  rpc UpdateHost(UpdateHostRequest) returns (UpdateHostResponse);
+
+  // Get available cameras and encoders
+  rpc GetAvailableDevices(GetAvailableDevicesRequest) returns (GetAvailableDevicesResponse);
+}

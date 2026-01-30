@@ -2,23 +2,31 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <gst/gst.h>
-#include <jansson.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
-#include <errno.h>
-#include <jansson.h>
-#include <glob.h>
 #include <glib.h>
 #include <glib/gstdio.h>
+#include <jansson.h>
+#include "grpc_wrapper.h"
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
+// Avahi not available on macOS - disable mDNS features
+#define HAVE_AVAHI 0
+#else
+// Avahi available on Linux systems
+#define HAVE_AVAHI 1
+#include <avahi-client/client.h>
+#include <avahi-client/publish.h>
+#include <avahi-common/error.h>
+#include <avahi-glib/glib-watch.h>
 #endif
 
+#define GRPC_PORT 50051
 #define DEFAULT_SERIAL_DEVICE "/dev/ttyGS0"
 #define DEFAULT_WIFI_INTERFACE "wlan0"
 #define DEFAULT_CONFIG_FILENAME "config.json"
@@ -65,9 +73,19 @@ typedef struct {
     gint signal_dbm;
 } WifiNetwork;
 
+#if HAVE_AVAHI
+// mDNS service advertisement context
+typedef struct {
+    AvahiGLibPoll *glib_poll;
+    AvahiClient *client;
+    AvahiEntryGroup *group;
+} MDNSContext;
+#endif
+
 typedef struct _CustomData {
     GstElement *pipeline;
     GstBus *bus;
+    f1sh_grpc_server_t *grpc_server;
     AppConfig config;
     StreamStats stats;
     GMutex state_mutex;
@@ -75,6 +93,9 @@ typedef struct _CustomData {
     gboolean should_terminate;
     SerialContext serial;
     gchar *config_file_path;
+#if HAVE_AVAHI
+    MDNSContext mdns;
+#endif
 } CustomData;
 
 // Function declarations
@@ -102,8 +123,6 @@ static gboolean handle_wifi_connect_request(CustomData *data, json_t *payload);
 static gboolean handle_swap_resolution_request(CustomData *data, json_t *payload);
 static gboolean handle_host_update_request(CustomData *data, json_t *payload);
 static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out);
-static gboolean ensure_resolution_orientation(CustomData *data, gboolean want_swapped,
-                                              gboolean *changed_out, gboolean *persisted_out);
 static gboolean collect_wifi_networks(json_t **result_array);
 static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length);
 static gchar* sanitize_utf8(const gchar *value);
@@ -118,6 +137,12 @@ static gboolean run_command_sync(gchar * const argv[], gchar **stdout_out);
 static gboolean get_interface_ipv4(const char *iface, gchar **ip_out);
 static gboolean connect_to_wifi_bssid(const char *iface, const char *bssid, const char *ssid,
                                       const char *passphrase, gchar **ip_address_out);
+#if HAVE_AVAHI
+static void mdns_client_callback(AvahiClient *client, AvahiClientState state, void *userdata);
+static void mdns_entry_group_callback(AvahiEntryGroup *group, AvahiEntryGroupState state, void *userdata);
+static gboolean init_mdns_service(CustomData *data);
+static void shutdown_mdns_service(CustomData *data);
+#endif
 
 // Probe callback to monitor data flow
 static GstPadProbeReturn
@@ -1059,62 +1084,6 @@ static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out
     return TRUE;
 }
 
-static gboolean ensure_resolution_orientation(CustomData *data, gboolean want_swapped,
-                                              gboolean *changed_out, gboolean *persisted_out) {
-    if (!data) {
-        return FALSE;
-    }
-
-    if (changed_out) {
-        *changed_out = FALSE;
-    }
-    if (persisted_out) {
-        *persisted_out = TRUE;
-    }
-
-    g_mutex_lock(&data->state_mutex);
-    gboolean need_swap = FALSE;
-    if (want_swapped) {
-        // Swapped orientation: width <= height
-        if (data->config.width >= data->config.height) {
-            need_swap = TRUE;
-        }
-    } else {
-        // Unswapped orientation: width >= height
-        if (data->config.width < data->config.height) {
-            need_swap = TRUE;
-        }
-    }
-
-    if (need_swap) {
-        gint tmp = data->config.width;
-        data->config.width = data->config.height;
-        data->config.height = tmp;
-        data->pipeline_is_restarting = TRUE;
-        if (changed_out) {
-            *changed_out = TRUE;
-        }
-    }
-
-    gboolean persisted = TRUE;
-    if (data->config_file_path) {
-        persisted = save_config_to_file(&data->config, data->config_file_path);
-    } else {
-        persisted = FALSE;
-    }
-
-    gint width = data->config.width;
-    gint height = data->config.height;
-    g_mutex_unlock(&data->state_mutex);
-
-    if (persisted_out) {
-        *persisted_out = persisted;
-    }
-
-    // Return width/height via changed_out/persisted_out not required; callers may re-read.
-    return TRUE;
-}
-
 static gboolean handle_wifi_scan_request(CustomData *data) {
     json_t *wifi_networks = NULL;
     if (!collect_wifi_networks(&wifi_networks)) {
@@ -1398,249 +1367,250 @@ static void shutdown_serial_context(CustomData *data) {
     g_mutex_clear(&serial->write_mutex);
 }
 
-// Get available libcamera cameras
-static json_t* get_available_cameras(void) {
-    json_t *cameras = json_array();
-    
-    // Create a temporary libcamerasrc element to query device properties
-    GstElement *src = gst_element_factory_make("libcamerasrc", "temp_src");
-    if (src) {
-        // Try to get the device property which might list available cameras
-        GParamSpec *pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), "camera-name");
-        if (pspec) {
-            // Get current camera name (default)
-            gchar *current_camera = NULL;
-            g_object_get(src, "camera-name", &current_camera, NULL);
-            if (current_camera && strlen(current_camera) > 0) {
-                json_array_append_new(cameras, json_string(current_camera));
-                g_free(current_camera);
-            }
-        }
-        
-        gst_object_unref(src);
-    }
-    
-    // Try to enumerate cameras by testing libcamerasrc in different states
-    // This is a more direct approach to find working cameras
-    for (int cam_index = 0; cam_index < 10; cam_index++) {
-        GstElement *test_src = gst_element_factory_make("libcamerasrc", "test_cam");
-        if (test_src) {
-            gchar *cam_name = g_strdup_printf("camera%d", cam_index);
-            g_object_set(test_src, "camera-name", cam_name, NULL);
-            
-            // Try to set to READY state to see if camera exists
-            GstStateChangeReturn ret = gst_element_set_state(test_src, GST_STATE_READY);
-            if (ret != GST_STATE_CHANGE_FAILURE) {
-                // Camera seems to exist, add it
-                gchar *actual_name = NULL;
-                g_object_get(test_src, "camera-name", &actual_name, NULL);
-                if (actual_name && strlen(actual_name) > 0) {
-                    // Check if not already in list
-                    gboolean found = FALSE;
-                    size_t array_size = json_array_size(cameras);
-                    for (size_t j = 0; j < array_size; j++) {
-                        json_t *item = json_array_get(cameras, j);
-                        const char *existing = json_string_value(item);
-                        if (existing && strcmp(existing, actual_name) == 0) {
-                            found = TRUE;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        json_array_append_new(cameras, json_string(actual_name));
-                        g_print("Found camera: %s\n", actual_name);
-                    }
-                    g_free(actual_name);
-                }
-                gst_element_set_state(test_src, GST_STATE_NULL);
-            }
-            
-            g_free(cam_name);
-            gst_object_unref(test_src);
-        }
-    }
-    
-    // If no specific cameras found, add auto-detect as fallback
-    if (json_array_size(cameras) == 0) {
-        json_array_append_new(cameras, json_string("auto-detect"));
-        g_print("No specific cameras detected, using auto-detect\n");
-    }
-    
-    return cameras;
+// ==================== gRPC Callback Implementations ====================
+
+// Health check callback
+static void grpc_health_cb(void* user_data, char** status_out) {
+    *status_out = strdup("healthy");
 }
 
-// Get available encoders
-static json_t* get_available_encoders(void) {
-    json_t *encoders = json_array();
-    
-    // List of potential encoders to check for availability
-    const gchar *encoder_list[] = {
-        "v4l2h264enc",    // Hardware encoder (Pi default)
-        "omxh264enc",     // OpenMAX encoder (Pi legacy)
-        "x264enc",        // Software encoder
-        "nvh264enc",      // NVIDIA hardware encoder
-        "vaapih264enc",   // Intel VAAPI encoder
-        "qsvh264enc",     // Intel Quick Sync encoder
-        "vtenc_h264",     // Apple VideoToolbox encoder (macOS)
-        "mfh264enc",      // Microsoft Media Foundation encoder (Windows)
-        NULL
-    };
-    
-    for (int i = 0; encoder_list[i]; i++) {
-        GstElementFactory *factory = gst_element_factory_find(encoder_list[i]);
-        if (factory) {
-            // Double-check by trying to create the element
-            GstElement *test_element = gst_element_factory_create(factory, "test");
-            if (test_element) {
-                json_array_append_new(encoders, json_string(encoder_list[i]));
-                gst_object_unref(test_element);
-                g_print("Found available encoder: %s\n", encoder_list[i]);
+// Get stats callback
+static void grpc_get_stats_cb(void* user_data, uint64_t* total_bytes,
+                               uint64_t* frame_count, double* bitrate) {
+    CustomData *data = (CustomData*)user_data;
+    g_mutex_lock(&data->stats.stats_mutex);
+
+    *total_bytes = data->stats.total_bytes;
+    *frame_count = data->stats.frame_count;
+
+    // Calculate current bitrate (kbps)
+    GstClockTime current_time = gst_clock_get_time(gst_system_clock_obtain());
+    GstClockTime elapsed = current_time - data->stats.start_time;
+    if (elapsed > 0) {
+        *bitrate = (data->stats.total_bytes * 8.0 * GST_SECOND) / (elapsed * 1000.0);
+    } else {
+        *bitrate = 0.0;
+    }
+
+    g_mutex_unlock(&data->stats.stats_mutex);
+}
+
+// Get config callback
+static void grpc_get_config_cb(void* user_data, grpc_config_t* config) {
+    CustomData *data = (CustomData*)user_data;
+    g_mutex_lock(&data->state_mutex);
+
+    config->host = g_strdup(data->config.host);
+    config->port = data->config.port;
+    config->camera_name = g_strdup(data->config.camera_name);
+    config->encoder_type = g_strdup(data->config.encoder_type);
+    config->width = data->config.width;
+    config->height = data->config.height;
+    config->framerate = data->config.framerate;
+
+    g_mutex_unlock(&data->state_mutex);
+}
+
+// Update config callback
+static int grpc_update_config_cb(void* user_data, const grpc_config_update_t* update,
+                                  grpc_config_t* new_config, char** error_msg) {
+    CustomData *data = (CustomData*)user_data;
+    gboolean needs_rebuild = FALSE;
+    gboolean needs_host_update = FALSE;
+    gboolean needs_port_update = FALSE;
+
+    g_mutex_lock(&data->state_mutex);
+
+    // Apply updates
+    if (update->has_host && update->host) {
+        g_free(data->config.host);
+        data->config.host = g_strdup(update->host);
+        needs_host_update = TRUE;
+    }
+    if (update->has_port) {
+        data->config.port = update->port;
+        needs_port_update = TRUE;
+    }
+    if (update->has_camera_name && update->camera_name) {
+        g_free(data->config.camera_name);
+        data->config.camera_name = g_strdup(update->camera_name);
+        needs_rebuild = TRUE;
+    }
+    if (update->has_encoder_type && update->encoder_type) {
+        g_free(data->config.encoder_type);
+        data->config.encoder_type = g_strdup(update->encoder_type);
+        needs_rebuild = TRUE;
+    }
+    if (update->has_width) {
+        data->config.width = update->width;
+        needs_rebuild = TRUE;
+    }
+    if (update->has_height) {
+        data->config.height = update->height;
+        needs_rebuild = TRUE;
+    }
+    if (update->has_framerate) {
+        data->config.framerate = update->framerate;
+        needs_rebuild = TRUE;
+    }
+
+    // Save config
+    if (!save_config_to_file(&data->config, data->config_file_path)) {
+        *error_msg = strdup("Failed to save configuration");
+        g_mutex_unlock(&data->state_mutex);
+        return 0;
+    }
+
+    // Update UDP sink if only host/port changed
+    if ((needs_host_update || needs_port_update) && !needs_rebuild && data->pipeline) {
+        GstElement *udpsink = gst_bin_get_by_name(GST_BIN(data->pipeline), "udpsink");
+        if (udpsink) {
+            if (needs_host_update) {
+                g_object_set(udpsink, "host", data->config.host, NULL);
             }
+            if (needs_port_update) {
+                g_object_set(udpsink, "port", data->config.port, NULL);
+            }
+            gst_object_unref(udpsink);
+            g_print("Updated UDP destination to %s:%d without pipeline rebuild\n",
+                    data->config.host, data->config.port);
+        }
+    }
+
+    // Return new config
+    new_config->host = g_strdup(data->config.host);
+    new_config->port = data->config.port;
+    new_config->camera_name = g_strdup(data->config.camera_name);
+    new_config->encoder_type = g_strdup(data->config.encoder_type);
+    new_config->width = data->config.width;
+    new_config->height = data->config.height;
+    new_config->framerate = data->config.framerate;
+
+    if (needs_rebuild) {
+        data->pipeline_is_restarting = TRUE;
+    }
+
+    g_mutex_unlock(&data->state_mutex);
+    return 1;
+}
+
+// Swap resolution callback
+static int grpc_swap_resolution_cb(void* user_data, grpc_config_t* new_config,
+                                    char** error_msg) {
+    CustomData *data = (CustomData*)user_data;
+    gboolean persisted = FALSE;
+
+    if (!swap_config_resolution(data, &persisted)) {
+        *error_msg = strdup("Failed to swap resolution");
+        return 0;
+    }
+
+    g_mutex_lock(&data->state_mutex);
+    new_config->host = g_strdup(data->config.host);
+    new_config->port = data->config.port;
+    new_config->camera_name = g_strdup(data->config.camera_name);
+    new_config->encoder_type = g_strdup(data->config.encoder_type);
+    new_config->width = data->config.width;
+    new_config->height = data->config.height;
+    new_config->framerate = data->config.framerate;
+    g_mutex_unlock(&data->state_mutex);
+
+    return 1;
+}
+
+// Update host callback
+static int grpc_update_host_cb(void* user_data, const char* host, char** error_msg) {
+    CustomData *data = (CustomData*)user_data;
+
+    g_mutex_lock(&data->state_mutex);
+    g_free(data->config.host);
+    data->config.host = g_strdup(host);
+
+    if (!save_config_to_file(&data->config, data->config_file_path)) {
+        *error_msg = strdup("Failed to save configuration");
+        g_mutex_unlock(&data->state_mutex);
+        return 0;
+    }
+
+    // Update UDP sink if pipeline exists
+    if (data->pipeline) {
+        GstElement *udpsink = gst_bin_get_by_name(GST_BIN(data->pipeline), "udpsink");
+        if (udpsink) {
+            g_object_set(udpsink, "host", data->config.host, NULL);
+            gst_object_unref(udpsink);
+            g_print("Updated UDP host to %s\n", data->config.host);
+        }
+    }
+
+    g_mutex_unlock(&data->state_mutex);
+    return 1;
+}
+
+// Get available devices callback
+static void grpc_get_devices_cb(void* user_data, grpc_devices_t* devices) {
+    // List available cameras
+    GList *camera_list = NULL;
+    GstDeviceMonitor *monitor = gst_device_monitor_new();
+    GstCaps *caps = gst_caps_new_empty_simple("video/x-raw");
+    gst_device_monitor_add_filter(monitor, "Video/Source", caps);
+    gst_caps_unref(caps);
+
+    if (gst_device_monitor_start(monitor)) {
+        camera_list = gst_device_monitor_get_devices(monitor);
+        gst_device_monitor_stop(monitor);
+    }
+
+    // Count cameras
+    devices->num_cameras = g_list_length(camera_list);
+    devices->cameras = malloc(sizeof(grpc_camera_info_t) * devices->num_cameras);
+
+    GList *l;
+    int i = 0;
+    for (l = camera_list; l != NULL; l = l->next) {
+        GstDevice *device = (GstDevice *)l->data;
+        gchar *name = gst_device_get_display_name(device);
+        gchar *path = gst_device_get_device_class(device);
+
+        devices->cameras[i].name = strdup(name ? name : "Unknown");
+        devices->cameras[i].path = strdup(path ? path : "");
+
+        g_free(name);
+        g_free(path);
+        gst_object_unref(device);
+        i++;
+    }
+    g_list_free(camera_list);
+    gst_object_unref(monitor);
+
+    // List available encoders
+    const char *encoder_names[] = {"v4l2h264enc", "omxh264enc", "x264enc", "nvh264enc", "vaapih264enc", NULL};
+    int encoder_count = 0;
+
+    // Count available encoders
+    for (int j = 0; encoder_names[j] != NULL; j++) {
+        GstElementFactory *factory = gst_element_factory_find(encoder_names[j]);
+        if (factory) {
+            encoder_count++;
             gst_object_unref(factory);
         }
     }
-    
-    // If no encoders found (unlikely), add x264enc as it's usually available
-    if (json_array_size(encoders) == 0) {
-        g_print("Warning: No H.264 encoders detected, adding x264enc as fallback\n");
-        json_array_append_new(encoders, json_string("x264enc"));
+
+    devices->num_encoders = encoder_count;
+    devices->encoders = malloc(sizeof(grpc_encoder_info_t) * devices->num_encoders);
+
+    int enc_idx = 0;
+    for (int j = 0; encoder_names[j] != NULL; j++) {
+        GstElementFactory *factory = gst_element_factory_find(encoder_names[j]);
+        if (factory) {
+            devices->encoders[enc_idx].name = strdup(encoder_names[j]);
+            devices->encoders[enc_idx].available = 1;
+            gst_object_unref(factory);
+            enc_idx++;
+        }
     }
-    
-    return encoders;
 }
 
-// Get supported resolutions for a camera
-static json_t* get_camera_resolutions(const gchar *camera_name) {
-    json_t *resolutions = json_array();
-    
-    // Create a libcamerasrc element and try to query its actual capabilities
-    GstElement *src = gst_element_factory_make("libcamerasrc", "probe_src");
-    if (!src) {
-        g_printerr("Failed to create libcamerasrc for resolution probing\n");
-        return resolutions;
-    }
-    
-    // Set camera name if specified
-    if (camera_name && strcmp(camera_name, "auto-detect") != 0) {
-        g_object_set(src, "camera-name", camera_name, NULL);
-    }
-    
-    // Try to get the source pad to query capabilities
-    GstPad *src_pad = gst_element_get_static_pad(src, "src");
-    if (src_pad) {
-        // Set element to READY state to allow caps negotiation
-        GstStateChangeReturn ret = gst_element_set_state(src, GST_STATE_READY);
-        if (ret != GST_STATE_CHANGE_FAILURE) {
-            // Get the pad template caps
-            GstPadTemplate *pad_template = gst_element_class_get_pad_template(
-                GST_ELEMENT_GET_CLASS(src), "src");
-            if (pad_template) {
-                GstCaps *template_caps = gst_pad_template_get_caps(pad_template);
-                if (template_caps) {
-                    g_print("Probing camera capabilities for %s\n", camera_name ? camera_name : "auto-detect");
-                    
-                    // Parse the caps to extract supported resolutions
-                    guint num_structures = gst_caps_get_size(template_caps);
-                    for (guint i = 0; i < num_structures; i++) {
-                        GstStructure *structure = gst_caps_get_structure(template_caps, i);
-                        const gchar *format_name = gst_structure_get_name(structure);
-                        
-                        // Only process video/x-raw structures
-                        if (g_str_has_prefix(format_name, "video/x-raw")) {
-                            const GValue *width_val = gst_structure_get_value(structure, "width");
-                            const GValue *height_val = gst_structure_get_value(structure, "height");
-                            const GValue *framerate_val = gst_structure_get_value(structure, "framerate");
-                            
-                            if (width_val && height_val) {
-                                // Handle different value types (int, int range, list)
-                                if (G_VALUE_HOLDS_INT(width_val) && G_VALUE_HOLDS_INT(height_val)) {
-                                    int width = g_value_get_int(width_val);
-                                    int height = g_value_get_int(height_val);
-                                    int max_fps = 30; // default
-                                    
-                                    if (framerate_val && GST_VALUE_HOLDS_FRACTION(framerate_val)) {
-                                        max_fps = gst_value_get_fraction_numerator(framerate_val) / 
-                                                gst_value_get_fraction_denominator(framerate_val);
-                                    }
-                                    
-                                    json_t *res = json_object();
-                                    json_object_set_new(res, "width", json_integer(width));
-                                    json_object_set_new(res, "height", json_integer(height));
-                                    json_object_set_new(res, "max_framerate", json_integer(max_fps));
-                                    json_object_set_new(res, "format", json_string("probed"));
-                                    json_array_append_new(resolutions, res);
-                                    
-                                    g_print("Found resolution: %dx%d@%dfps\n", width, height, max_fps);
-                                }
-                                else if (GST_VALUE_HOLDS_INT_RANGE(width_val) && GST_VALUE_HOLDS_INT_RANGE(height_val)) {
-                                    int min_width = gst_value_get_int_range_min(width_val);
-                                    int max_width = gst_value_get_int_range_max(width_val);
-                                    int min_height = gst_value_get_int_range_min(height_val);
-                                    int max_height = gst_value_get_int_range_max(height_val);
-                                    
-                                    g_print("Found resolution range: %dx%d to %dx%d\n", 
-                                           min_width, min_height, max_width, max_height);
-                                    
-                                    // Add some common resolutions within the range
-                                    typedef struct { int w, h, fps; } common_res_t;
-                                    common_res_t test_resolutions[] = {
-                                        {640, 480, 60}, {1280, 720, 60}, {1920, 1080, 30},
-                                        {2304, 1296, 25}, {4608, 2592, 10}, {0, 0, 0}
-                                    };
-                                    
-                                    for (int j = 0; test_resolutions[j].w > 0; j++) {
-                                        if (test_resolutions[j].w >= min_width && test_resolutions[j].w <= max_width &&
-                                            test_resolutions[j].h >= min_height && test_resolutions[j].h <= max_height) {
-                                            
-                                            json_t *res = json_object();
-                                            json_object_set_new(res, "width", json_integer(test_resolutions[j].w));
-                                            json_object_set_new(res, "height", json_integer(test_resolutions[j].h));
-                                            json_object_set_new(res, "max_framerate", json_integer(test_resolutions[j].fps));
-                                            json_object_set_new(res, "format", json_string("range-tested"));
-                                            json_array_append_new(resolutions, res);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    gst_caps_unref(template_caps);
-                }
-            }
-        } else {
-            g_printerr("Failed to set camera to READY state for capability probing\n");
-        }
-        
-        gst_element_set_state(src, GST_STATE_NULL);
-        gst_object_unref(src_pad);
-    }
-    
-    gst_object_unref(src);
-    
-    // If no resolutions were probed, provide minimal fallback
-    if (json_array_size(resolutions) == 0) {
-        g_print("No resolutions probed, adding basic fallbacks\n");
-        
-        typedef struct { int w; int h; int fps; const char* desc; } fallback_res_t;
-        fallback_res_t fallback_resolutions[] = {
-            {640, 480, 30, "VGA (basic fallback)"},
-            {1280, 720, 30, "HD (basic fallback)"},
-            {1920, 1080, 15, "Full HD (basic fallback)"},
-            {0, 0, 0, NULL}
-        };
-        
-        for (int i = 0; fallback_resolutions[i].w > 0; i++) {
-            json_t *res = json_object();
-            json_object_set_new(res, "width", json_integer(fallback_resolutions[i].w));
-            json_object_set_new(res, "height", json_integer(fallback_resolutions[i].h));
-            json_object_set_new(res, "max_framerate", json_integer(fallback_resolutions[i].fps));
-            json_object_set_new(res, "description", json_string(fallback_resolutions[i].desc));
-            json_array_append_new(resolutions, res);
-        }
-    }
-    
-    return resolutions;
-}
+// ==================== End of gRPC Callbacks ====================
 
 static gboolean build_and_run_pipeline(CustomData *data) {
     g_mutex_lock(&data->state_mutex);
@@ -1893,6 +1863,174 @@ error:
     return FALSE;
 }
 
+#if HAVE_AVAHI
+// mDNS Entry Group callback - handles service registration state changes
+static void mdns_entry_group_callback(AvahiEntryGroup *group, AvahiEntryGroupState state, void *userdata) {
+    (void)userdata; // Unused parameter
+
+    switch (state) {
+        case AVAHI_ENTRY_GROUP_ESTABLISHED:
+            g_print("mDNS service 'F1sh Camera TX' successfully established\n");
+            break;
+
+        case AVAHI_ENTRY_GROUP_COLLISION:
+            g_printerr("mDNS service name collision, consider renaming the service\n");
+            break;
+
+        case AVAHI_ENTRY_GROUP_FAILURE:
+            g_printerr("mDNS entry group failure: %s\n",
+                      avahi_strerror(avahi_client_errno(avahi_entry_group_get_client(group))));
+            break;
+
+        case AVAHI_ENTRY_GROUP_UNCOMMITED:
+        case AVAHI_ENTRY_GROUP_REGISTERING:
+            break;
+    }
+}
+
+// mDNS Client callback - handles Avahi client state changes
+static void mdns_client_callback(AvahiClient *client, AvahiClientState state, void *userdata) {
+    CustomData *data = (CustomData *)userdata;
+
+    switch (state) {
+        case AVAHI_CLIENT_S_RUNNING:
+            // Client is running, create service entry group
+            if (!data->mdns.group) {
+                data->mdns.group = avahi_entry_group_new(client, mdns_entry_group_callback, data);
+                if (!data->mdns.group) {
+                    g_printerr("Failed to create mDNS entry group: %s\n",
+                              avahi_strerror(avahi_client_errno(client)));
+                    return;
+                }
+            }
+
+            // Add service to the entry group
+            if (avahi_entry_group_is_empty(data->mdns.group)) {
+                int ret;
+
+                // Register _grpc._tcp service for the gRPC API
+                ret = avahi_entry_group_add_service(
+                    data->mdns.group,
+                    AVAHI_IF_UNSPEC,           // Interface (any)
+                    AVAHI_PROTO_UNSPEC,        // Protocol (IPv4/IPv6)
+                    0,                          // Flags
+                    "F1sh Camera TX",          // Service name
+                    "_grpc._tcp",              // Service type
+                    NULL,                       // Domain (use default)
+                    NULL,                       // Host (use default)
+                    GRPC_PORT,                 // Port
+                    "proto=f1sh_camera",       // TXT record
+                    "version=0.1",             // TXT record: version
+                    "type=camera",             // TXT record: device type
+                    NULL                        // End of TXT records
+                );
+
+                if (ret < 0) {
+                    g_printerr("Failed to add mDNS _grpc._tcp service: %s\n", avahi_strerror(ret));
+                    return;
+                }
+
+                // Register custom _f1sh-camera._tcp service for camera streaming
+                ret = avahi_entry_group_add_service(
+                    data->mdns.group,
+                    AVAHI_IF_UNSPEC,
+                    AVAHI_PROTO_UNSPEC,
+                    0,
+                    "F1sh Camera TX",
+                    "_f1sh-camera._tcp",
+                    NULL,
+                    NULL,
+                    data->config.port,         // UDP streaming port
+                    "protocol=udp",             // TXT record: protocol
+                    "encoding=h264",            // TXT record: video encoding
+                    "control_port=50051",       // TXT record: gRPC control port
+                    NULL
+                );
+
+                if (ret < 0) {
+                    g_printerr("Failed to add mDNS _f1sh-camera._tcp service: %s\n", avahi_strerror(ret));
+                    return;
+                }
+
+                // Commit the entry group
+                ret = avahi_entry_group_commit(data->mdns.group);
+                if (ret < 0) {
+                    g_printerr("Failed to commit mDNS entry group: %s\n", avahi_strerror(ret));
+                }
+            }
+            break;
+
+        case AVAHI_CLIENT_FAILURE:
+            g_printerr("mDNS client failure: %s\n", avahi_strerror(avahi_client_errno(client)));
+            break;
+
+        case AVAHI_CLIENT_S_COLLISION:
+        case AVAHI_CLIENT_S_REGISTERING:
+            // Remove existing services if any
+            if (data->mdns.group) {
+                avahi_entry_group_reset(data->mdns.group);
+            }
+            break;
+
+        case AVAHI_CLIENT_CONNECTING:
+            break;
+    }
+}
+
+// Initialize mDNS service advertisement
+static gboolean init_mdns_service(CustomData *data) {
+    int error;
+
+    // Create the GLib poll wrapper
+    data->mdns.glib_poll = avahi_glib_poll_new(NULL, G_PRIORITY_DEFAULT);
+    if (!data->mdns.glib_poll) {
+        g_printerr("Failed to create Avahi GLib poll object\n");
+        return FALSE;
+    }
+
+    // Create Avahi client
+    data->mdns.client = avahi_client_new(
+        avahi_glib_poll_get(data->mdns.glib_poll),
+        0,
+        mdns_client_callback,
+        data,
+        &error
+    );
+
+    if (!data->mdns.client) {
+        g_printerr("Failed to create Avahi client: %s\n", avahi_strerror(error));
+        avahi_glib_poll_free(data->mdns.glib_poll);
+        data->mdns.glib_poll = NULL;
+        return FALSE;
+    }
+
+    g_print("mDNS service advertising initialized\n");
+    g_print("Service discoverable as 'F1sh Camera TX' via mDNS/Bonjour/Zeroconf\n");
+
+    return TRUE;
+}
+
+// Shutdown mDNS service advertisement
+static void shutdown_mdns_service(CustomData *data) {
+    if (data->mdns.group) {
+        avahi_entry_group_free(data->mdns.group);
+        data->mdns.group = NULL;
+    }
+
+    if (data->mdns.client) {
+        avahi_client_free(data->mdns.client);
+        data->mdns.client = NULL;
+    }
+
+    if (data->mdns.glib_poll) {
+        avahi_glib_poll_free(data->mdns.glib_poll);
+        data->mdns.glib_poll = NULL;
+    }
+
+    g_print("mDNS service advertising stopped\n");
+}
+#endif
+
 int main(int argc, char *argv[]) {
     CustomData data;
     GstBus *bus;
@@ -1956,6 +2094,45 @@ int main(int argc, char *argv[]) {
         g_free(data.config_file_path);
         return -1;
     }
+
+    // Setup gRPC callbacks
+    grpc_callbacks callbacks = {
+        .health_callback = grpc_health_cb,
+        .get_stats_callback = grpc_get_stats_cb,
+        .get_config_callback = grpc_get_config_cb,
+        .update_config_callback = grpc_update_config_cb,
+        .swap_resolution_callback = grpc_swap_resolution_cb,
+        .update_host_callback = grpc_update_host_cb,
+        .get_devices_callback = grpc_get_devices_cb,
+        .user_data = &data
+    };
+
+    // Start gRPC server
+    data.grpc_server = f1sh_grpc_server_start("0.0.0.0:50051", &callbacks);
+    if (data.grpc_server == NULL) {
+        g_printerr("Failed to start gRPC server.\n");
+        exit_code = -1;
+        goto cleanup;
+    }
+
+    g_print("gRPC server started on port 50051\n");
+    g_print("Available RPC methods:\n");
+    g_print("  Health - Health check\n");
+    g_print("  GetStats - Stream statistics\n");
+    g_print("  GetConfig - Get current configuration\n");
+    g_print("  UpdateConfig - Update configuration\n");
+    g_print("  SwapResolution - Swap width/height\n");
+    g_print("  UpdateHost - Update UDP destination\n");
+    g_print("  GetAvailableDevices - List cameras and encoders\n");
+
+#if HAVE_AVAHI
+    // Initialize mDNS service advertisement
+    if (!init_mdns_service(&data)) {
+        g_printerr("Warning: Failed to initialize mDNS service advertisement. Continuing without mDNS.\n");
+    }
+#else
+    g_print("mDNS service advertisement not available on this platform\n");
+#endif
 
     do {
         g_mutex_lock(&data.state_mutex);
@@ -2052,6 +2229,15 @@ int main(int argc, char *argv[]) {
     } while (!data.should_terminate);
 
 cleanup:
+#if HAVE_AVAHI
+    shutdown_mdns_service(&data);
+#endif
+
+    if (data.grpc_server) {
+        f1sh_grpc_server_stop(data.grpc_server);
+        data.grpc_server = NULL;
+    }
+
     g_mutex_lock(&data.state_mutex);
     if (data.pipeline) {
         gst_element_set_state(data.pipeline, GST_STATE_NULL);
