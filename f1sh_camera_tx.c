@@ -2180,8 +2180,7 @@ int main(int argc, char *argv[]) {
                         
                         // Log encoder errors but don't auto-fallback to avoid infinite loops
                         if (strstr(GST_OBJECT_NAME(msg->src), "encoder")) {
-                            g_printerr("Encoder error detected. Consider using a different encoder via /config API.\n");
-                            g_printerr("Try: curl -X POST http://localhost:8888/config -d '{\"encoder\":\"x264enc\"}'\n");
+                            g_printerr("Encoder error detected. Consider using a different encoder via serial config update.\n");
                         }
                         
                         data.should_terminate = TRUE;
