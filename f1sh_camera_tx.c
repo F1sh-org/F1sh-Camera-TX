@@ -1908,28 +1908,6 @@ static void mdns_client_callback(AvahiClient *client, AvahiClientState state, vo
             if (avahi_entry_group_is_empty(data->mdns.group)) {
                 int ret;
 
-                // Register _grpc._tcp service for the gRPC API
-                ret = avahi_entry_group_add_service(
-                    data->mdns.group,
-                    AVAHI_IF_UNSPEC,           // Interface (any)
-                    AVAHI_PROTO_UNSPEC,        // Protocol (IPv4/IPv6)
-                    0,                          // Flags
-                    "F1sh Camera TX",          // Service name
-                    "_grpc._tcp",              // Service type
-                    NULL,                       // Domain (use default)
-                    NULL,                       // Host (use default)
-                    GRPC_PORT,                 // Port
-                    "proto=f1sh_camera",       // TXT record
-                    "version=0.1",             // TXT record: version
-                    "type=camera",             // TXT record: device type
-                    NULL                        // End of TXT records
-                );
-
-                if (ret < 0) {
-                    g_printerr("Failed to add mDNS _grpc._tcp service: %s\n", avahi_strerror(ret));
-                    return;
-                }
-
                 // Register custom _f1sh-camera._tcp service for camera streaming
                 ret = avahi_entry_group_add_service(
                     data->mdns.group,
