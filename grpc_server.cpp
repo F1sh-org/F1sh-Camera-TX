@@ -161,7 +161,8 @@ public:
                           SwapResolutionResponse* response) override {
         grpc_config_t new_config = {0};
         char* error_msg = nullptr;
-        int success = callbacks_.swap_resolution_callback(callbacks_.user_data, &new_config, &error_msg);
+        int swap = request->swap();
+        int success = callbacks_.swap_resolution_callback(callbacks_.user_data, swap, &new_config, &error_msg);
 
         response->set_success(success != 0);
         if (error_msg) {

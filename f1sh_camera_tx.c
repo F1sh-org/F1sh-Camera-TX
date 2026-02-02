@@ -122,7 +122,7 @@ static gboolean handle_config_request(CustomData *data);
 static gboolean handle_wifi_connect_request(CustomData *data, json_t *payload);
 static gboolean handle_swap_resolution_request(CustomData *data, json_t *payload);
 static gboolean handle_host_update_request(CustomData *data, json_t *payload);
-static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out);
+static gboolean swap_config_resolution(CustomData *data, gint swap, gboolean *persisted_out);
 static gboolean collect_wifi_networks(json_t **result_array);
 static gboolean serial_write_all(SerialContext *serial, const char *buffer, size_t length);
 static gchar* sanitize_utf8(const gchar *value);
@@ -973,23 +973,19 @@ static gboolean handle_swap_resolution_request(CustomData *data, json_t *payload
         return respond_with_status(data, 3);
     }
 
-    gint swap_flag = (gint)json_integer_value(swap_node);
-    if (swap_flag != 0 && swap_flag != 1) {
-        g_printerr("Serial: swap flag must be 0 or 1, got %d\n", swap_flag);
+    gint swap = (gint)json_integer_value(swap_node);
+    if (swap != 0 && swap != 1) {
+        g_printerr("Serial: swap flag must be 0 or 1, got %d\n", swap);
         return respond_with_status(data, 3);
     }
 
-    if (swap_flag == 0) {
-        return respond_with_status(data, 24);
-    }
-
     gboolean persisted = TRUE;
-    if (!swap_config_resolution(data, &persisted)) {
+    if (!swap_config_resolution(data, swap, &persisted)) {
         return respond_with_status(data, 3);
     }
 
     if (!persisted) {
-        g_printerr("Serial: failed to persist swapped resolution\n");
+        g_printerr("Serial: failed to persist resolution change\n");
     }
 
     return respond_with_status(data, 24);
@@ -1053,7 +1049,7 @@ static gboolean handle_host_update_request(CustomData *data, json_t *payload) {
     return respond_with_status(data, 23);
 }
 
-static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out) {
+static gboolean swap_config_resolution(CustomData *data, gint swap, gboolean *persisted_out) {
     if (!data) {
         return FALSE;
     }
@@ -1063,10 +1059,24 @@ static gboolean swap_config_resolution(CustomData *data, gboolean *persisted_out
     }
 
     g_mutex_lock(&data->state_mutex);
-    gint tmp = data->config.width;
-    data->config.width = data->config.height;
-    data->config.height = tmp;
-    data->pipeline_is_restarting = TRUE;
+
+    // swap=1: force width > height (landscape mode)
+    // swap=0: force width < height (portrait mode)
+    gboolean need_swap = FALSE;
+    if (swap == 1 && data->config.width < data->config.height) {
+        // Need to swap to make landscape
+        need_swap = TRUE;
+    } else if (swap == 0 && data->config.width > data->config.height) {
+        // Need to swap to make portrait
+        need_swap = TRUE;
+    }
+
+    if (need_swap) {
+        gint tmp = data->config.width;
+        data->config.width = data->config.height;
+        data->config.height = tmp;
+        data->pipeline_is_restarting = TRUE;
+    }
 
     gboolean persisted = TRUE;
     if (data->config_file_path) {
@@ -1495,13 +1505,13 @@ static int grpc_update_config_cb(void* user_data, const grpc_config_update_t* up
 }
 
 // Swap resolution callback
-static int grpc_swap_resolution_cb(void* user_data, grpc_config_t* new_config,
+static int grpc_swap_resolution_cb(void* user_data, int swap, grpc_config_t* new_config,
                                     char** error_msg) {
     CustomData *data = (CustomData*)user_data;
     gboolean persisted = FALSE;
 
-    if (!swap_config_resolution(data, &persisted)) {
-        *error_msg = strdup("Failed to swap resolution");
+    if (!swap_config_resolution(data, swap, &persisted)) {
+        *error_msg = strdup("Failed to set resolution");
         return 0;
     }
 
