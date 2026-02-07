@@ -1060,18 +1060,16 @@ static gboolean swap_config_resolution(CustomData *data, gint swap, gboolean *pe
 
     g_mutex_lock(&data->state_mutex);
 
-    // swap=1: force width > height (landscape mode)
-    // swap=0: force width < height (portrait mode)
-    gboolean need_swap = FALSE;
-    if (swap == 1 && data->config.width < data->config.height) {
-        // Need to swap to make landscape
-        need_swap = TRUE;
-    } else if (swap == 0 && data->config.width > data->config.height) {
-        // Need to swap to make portrait
-        need_swap = TRUE;
-    }
-
-    if (need_swap) {
+    // swap=0: force landscape mode (width > height), swap if needed
+    // swap=1: force portrait mode (width < height), swap if needed
+    if (swap == 0 && data->config.width < data->config.height) {
+        // Currently portrait, swap to landscape
+        gint tmp = data->config.width;
+        data->config.width = data->config.height;
+        data->config.height = tmp;
+        data->pipeline_is_restarting = TRUE;
+    } else if (swap == 1 && data->config.width > data->config.height) {
+        // Currently landscape, swap to portrait
         gint tmp = data->config.width;
         data->config.width = data->config.height;
         data->config.height = tmp;

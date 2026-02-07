@@ -77,7 +77,7 @@ message UpdateConfigResponse {
 }
 
 // Swap resolution request/response
-// swap: 1 = force landscape (width > height), 0 = force portrait (width < height)
+// swap: 0 = force landscape (width > height), 1 = force portrait (width < height)
 message SwapResolutionRequest {
   int32 swap = 1;
 }
@@ -120,7 +120,7 @@ service F1shCameraService {
   rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
 
   // Swap resolution (force landscape or portrait)
-  // swap: 1 = force landscape (width > height), 0 = force portrait (width < height)
+  // swap: 0 = force landscape (width > height), 1 = force portrait (width < height)
   rpc SwapResolution(SwapResolutionRequest) returns (SwapResolutionResponse);
 
   // Update UDP host

@@ -81,7 +81,7 @@ typedef struct {
                                   grpc_config_t* new_config, char** error_msg);
 
     // Swap resolution callback
-    // Input: swap (1 = force landscape width > height, 0 = force portrait width < height)
+    // Input: swap (0 = force landscape width > height, 1 = force portrait width < height)
     // Output: new_config should be filled in (strings allocated), error_msg if failed (allocated)
     // Return: 1 for success, 0 for failure
     int (*swap_resolution_callback)(void* user_data, int swap, grpc_config_t* new_config, char** error_msg);
